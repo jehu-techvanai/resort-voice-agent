@@ -238,7 +238,7 @@ async def put_settings(body: dict):
         try:
             import json as _json
             changed_fields = {k: v for k, v in body.items() if k in saved}
-            await db.audit_settings("admin_api", changed_fields, saved)
+            await vet_db.audit_settings("admin_api", changed_fields, saved)
         except Exception as e:
             _log.debug("settings audit skipped: %s", e)
     if saved["stt_engine"] != before:
@@ -382,9 +382,9 @@ async def unanswered_csv():
 
 @app.get("/api/admin/metrics", dependencies=[Depends(require_admin)])
 async def metrics():
-    if db.conn:
+    if vet_db.conn:
         try:
-            return {"ok": True, "metrics": await db.aggregate_metrics()}
+            return {"ok": True, "metrics": await vet_db.aggregate_metrics()}
         except Exception as e:
             raise HTTPException(500, f"metrics error: {e}")
     return {"ok": True, "metrics": {}, "note": "sqlite not enabled"}
@@ -394,29 +394,29 @@ async def metrics():
 async def conversations(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                         status: str | None = Query(None), q: str | None = Query(None),
                         mode: str | None = Query(None)):
-    if not db.conn:
+    if not vet_db.conn:
         raise HTTPException(503, "sqlite not enabled")
-    rows = await db.list_conversations(limit=limit, offset=offset, status=status, q=q, mode=mode)
+    rows = await vet_db.list_conversations(limit=limit, offset=offset, status=status, q=q, mode=mode)
     return {"ok": True, "rows": rows, "limit": limit, "offset": offset}
 
 
 @app.get("/api/admin/conversations/{conversation_id}/turns", dependencies=[Depends(require_admin)])
 async def conversation_turns(conversation_id: str):
-    if not db.conn:
+    if not vet_db.conn:
         raise HTTPException(503, "sqlite not enabled")
-    conv = await db.get_conversation(conversation_id)
+    conv = await vet_db.get_conversation(conversation_id)
     if not conv:
         raise HTTPException(404, "conversation not found")
-    turns = await db.list_turns(conversation_id)
-    contacts = await db.list_contacts(conversation_id)
+    turns = await vet_db.list_turns(conversation_id)
+    contacts = await vet_db.list_contacts(conversation_id)
     return {"ok": True, "conversation": conv, "turns": turns, "contacts": contacts}
 
 
 @app.patch("/api/admin/conversations/{conversation_id}/note", dependencies=[Depends(require_admin)])
 async def conversation_note(conversation_id: str, body: dict):
-    if not db.conn:
+    if not vet_db.conn:
         raise HTTPException(503, "sqlite not enabled")
-    conv = await db.get_conversation(conversation_id)
+    conv = await vet_db.get_conversation(conversation_id)
     if not conv:
         raise HTTPException(404, "conversation not found")
     note = body.get("note", "")
@@ -425,7 +425,7 @@ async def conversation_note(conversation_id: str, body: dict):
         note = str(note or "")
     if summary is not None and not isinstance(summary, str):
         summary = None
-    ok = await db.update_conversation_note(conversation_id, note, summary)
+    ok = await vet_db.update_conversation_note(conversation_id, note, summary)
     if not ok:
         raise HTTPException(400, "note update returned no changes")
     return {"ok": True}
@@ -433,12 +433,12 @@ async def conversation_note(conversation_id: str, body: dict):
 
 @app.get("/api/admin/conversations/{conversation_id}/export", dependencies=[Depends(require_admin)])
 async def conversation_export(conversation_id: str, format: str = Query("json", regex="^(json|csv)$")):
-    if not db.conn:
+    if not vet_db.conn:
         raise HTTPException(503, "sqlite not enabled")
-    conv = await db.get_conversation(conversation_id)
+    conv = await vet_db.get_conversation(conversation_id)
     if not conv:
         raise HTTPException(404, "conversation not found")
-    turns = await db.list_turns(conversation_id)
+    turns = await vet_db.list_turns(conversation_id)
     if format == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -454,17 +454,17 @@ async def conversation_export(conversation_id: str, format: str = Query("json", 
 @app.get("/api/admin/unanswered/list", dependencies=[Depends(require_admin)])
 async def unanswered_list(limit: int = Query(100, ge=1, le=500), resolved: bool | None = None,
                           mode: str | None = None):
-    if not db.conn:
+    if not vet_db.conn:
         # fallback to legacy jsonl path
         return {"ok": True, "items": store.list_unanswered(), "note": "using legacy unanswered store"}
-    rows = await db.list_unanswered_v2(limit=limit, resolved=resolved, mode=mode)
+    rows = await vet_db.list_unanswered_v2(limit=limit, resolved=resolved, mode=mode)
     return {"ok": True, "rows": rows}
 
 
 @app.patch("/api/admin/unanswered/list/{entry_id}", dependencies=[Depends(require_admin)])
 async def unanswered_list_update(entry_id: str, resolved: bool = Query(True)):
-    if db.conn:
-        await db.mark_unanswered_resolved(entry_id, resolved)
+    if vet_db.conn:
+        await vet_db.mark_unanswered_resolved(entry_id, resolved)
         return {"ok": True}
     # fallback: try legacy update (only supports note/name/phone)
     if not store.update_unanswered(entry_id, resolved=resolved):
@@ -521,7 +521,7 @@ async def dependency_health():
             redis_ok = await redis_store.redis.ping()
         except Exception as e:
             _log.warning("redis health check failed: %s", e)
-    db_ok = bool(db.conn)
+    db_ok = bool(vet_db.conn)
     return {"ok": True, "redis": {"url_filled": bool(config.REDIS_URL), "enabled": redis_store.enabled, "ok": redis_ok},
             "sqlite": {"path_filled": bool(config.SQLITE_DB), "ok": db_ok}}
 
