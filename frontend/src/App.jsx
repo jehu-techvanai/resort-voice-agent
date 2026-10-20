@@ -13,6 +13,7 @@ function useHashRoute() {
   return route
 }
 
+
 export default function App() {
   const route = useHashRoute()
   const [health, setHealth] = useState(null)
@@ -26,14 +27,13 @@ export default function App() {
     <div className="page">
       <header>
         <div>
-          <p className="eyebrow">{route === 'settings' ? 'Settings' : route === 'conversations' ? 'Conversations' : 'Front desk · voice agent'}</p>
+          <p className="eyebrow">{route === 'settings' ? 'Settings' : route === 'conversations' ? 'Conversations' : 'Front desk - voice agent'}</p>
           <h1>{health?.resort || 'Voice agent'}</h1>
         </div>
         <nav className="top">
           {route === 'settings' || route === 'conversations'
             ? <a className="ghost btn" href="#/">Back to agent</a>
-            : <><a className="ghost btn" href="#/settings">Settings</a>
-                 <a className="ghost btn" href="#/conversations">Conversations</a></>}
+            : <><a className="ghost btn" href="#/settings">Settings</a><a className="ghost btn" href="#/conversations">Conversations</a></>}
         </nav>
       </header>
       {err && <p className="error">{err}</p>}

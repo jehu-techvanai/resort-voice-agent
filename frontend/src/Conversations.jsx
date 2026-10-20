@@ -31,9 +31,10 @@ function Login({ onDone }) {
     } catch (e2) { setErr(e2.message) }
   }
   return (
-    <form className="card login" onSubmit={submit}>
-      <h2>Log in</h2>
-      <p className="note">The password is printed in the agent's terminal at startup, or set ADMIN_PASSWORD in .env.</p>
+    <form className="card login" onSubmit={submit}>       <h2>Log in</h2>
+      <p className="note">The password is printed in the agent terminal at startup, or set ADMIN_PASSWORD in .env.</p>
+
+
       <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Admin password" autoFocus />
       <button className="primary" type="submit">Log in</button>
       {err && <p className="error">{err}</p>}
@@ -94,7 +95,7 @@ export default function Conversations() {
       const d = await api(`/api/admin/conversations/${id}/export?format=${fmt}`, { raw: true, method: 'GET' })
       const blob = await d.blob()
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob)
-      a.download = `conversation-${id}.${fmt}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+      a.download = `conversation-${activeConvId}.${fmt}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000)
     } catch (e) { alert(e.message) }
   }
 
