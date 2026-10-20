@@ -415,8 +415,10 @@ class Session:
                 f"You are {s['agent_name']}, a receptionist at {s['business_name']}. "
                 f"A customer just said this while the agent was asleep: \"" + text + "\"\n"
                 "Is this a genuine customer utterance that deserves a reply? "
-                "This means a real question, request, greeting, statement, or anything a human would actually say to a receptionist. "
-                "NOT noise, echo, random sounds, or a few meaningless words.\n"
+                "YES for: any real question, request, greeting, statement, follow-up question, "
+                "or anything a human would actually say to a receptionist. "
+                "Also YES for follow-ups like 'who are you?', 'what was that?', or corrections. "
+                "NOT noise, echo, random sounds, or a few meaningless words like 'um', 'ah'.\n"
                 "Reply with exactly ONE word: YES or NO. Nothing else.\n"
             )
             resp = await asyncio.wait_for(
@@ -424,7 +426,7 @@ class Session:
                 timeout=3.0,
             )
             decision = resp.strip().upper()
-            if decision.startswith("YES"):
+            if decision.startswith("YES") or decision == "Y":
                 return True, text, True
             return False, text, True
         except Exception:

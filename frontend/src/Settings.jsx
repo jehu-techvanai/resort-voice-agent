@@ -376,7 +376,7 @@ function Observability() {
       </div>
       <div className="card">
         <h3>Metrics (from SQLite)</h3>
-        {metrics && metrics.metrics && Object.keys(metrics.metrics).length > 0 ? (
+        {metrics?.metrics ? (
           <dl className="table">
             {Object.entries(metrics.metrics).map(([k, v]) => (
               <div key={k}><dt>{k}</dt><dd>{String(v)}</dd></div>
@@ -384,7 +384,7 @@ function Observability() {
           </dl>
         ) : (
           <p className="note">{metrics?.note || 'No SQLite metrics available.'}</p>
-        )
+        )}
       </div>
       <div className="card">
         <h3>Conversations (SQLite)</h3>
@@ -392,7 +392,7 @@ function Observability() {
           <button className="ghost" onClick={() => loadConvs(20)}>Refresh</button>
           <div className="note">{convList?.rows?.length != null ? convList.rows.length + ' conversations' : ''}</div>
         </div>
-        {convList && convList.rows && convList.rows.length > 0 ? (
+        {convList?.rows?.length > 0 ? (
           <table className="table">
             <thead><tr><th>Conversation</th><th>Mode</th><th>Started</th><th>Status</th><th /></tr></thead>
             <tbody>
@@ -407,7 +407,7 @@ function Observability() {
         ) : (
           <p className="note">No conversations stored yet (SQLite may be disabled).</p>
         )}
-        {conv && conv.turns && (
+        {conv?.turns && (
           <div className="card" style={{marginTop: 12}}>
             <h3>Conversation {conv.conversation.id} — turns</h3>
             <div className="row">

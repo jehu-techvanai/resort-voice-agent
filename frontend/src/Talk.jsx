@@ -396,33 +396,31 @@ export default function Talk({ health }) {
           </details>
           <a className="ghost btn" href="#/conversations" style={{ fontSize: '12px', padding: '4px 10px' }}>View all conversations</a>
         </div>
-          {metrics ? (
-            <>
-              <dl>
-                {STAGES.map(([k, name]) => metrics[k] != null && (
-                  <div key={k}><dt>{name}</dt><dd>{metrics[k]} ms</dd></div>
-                ))}
-              </dl>
-              {metrics.heard_ms != null && (
-                <p className="headline"><strong>{metrics.heard_ms} ms</strong> from end of your speech to first sound</p>
-              )}
-              <p className="note">Server times start when your speech reached the server.</p>
-            </>
-          ) : <p className="note">Speak to see per-stage timings.</p>}
-          {health && (
-            <dl className="stack">
-              <div><dt>Device</dt><dd>{health.device}{health.mock ? ' (mock)' : ''}</dd></div>
-              <div><dt>STT</dt><dd>{health.stt_engine}</dd></div>
-              <div><dt>LLM</dt><dd>{health.llm}</dd></div>
-              <div><dt>Voice</dt><dd>{health.tts}</dd></div>
-              <div><dt>Knowledge</dt><dd>{health.kb_version} · {health.kb_chunks} chunks</dd></div>
-              <div><dt>v2 Redis</dt><dd>{health.v2?.redis_ok != null ? (health.v2.redis_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
-              <div><dt>v2 SQLite</dt><dd>{health.v2?.sqlite_ok != null ? (health.v2.sqlite_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
-              <div><dt>v2 Hybrid RAG</dt><dd>{health.v2?.hybrid_rag ? 'on' : 'off'}</dd></div>
+        {metrics ? (
+          <>
+            <dl>
+              {STAGES.map(([k, name]) => metrics[k] != null && (
+                <div key={k}><dt>{name}</dt><dd>{metrics[k]} ms</dd></div>
+              ))}
             </dl>
-          )}
-        </details>
-      </aside>
+            {metrics.heard_ms != null && (
+              <p className="headline"><strong>{metrics.heard_ms} ms</strong> from end of your speech to first sound</p>
+            )}
+            <p className="note">Server times start when your speech reached the server.</p>
+          </>
+        ) : <p className="note">Speak to see per-stage timings.</p>}
+        {health && (
+          <dl className="stack">
+            <div><dt>Device</dt><dd>{health.device}{health.mock ? ' (mock)' : ''}</dd></div>
+            <div><dt>STT</dt><dd>{health.stt_engine}</dd></div>
+            <div><dt>LLM</dt><dd>{health.llm}</dd></div>
+            <div><dt>Voice</dt><dd>{health.tts}</dd></div>
+            <div><dt>Knowledge</dt><dd>{health.kb_version} · {health.kb_chunks} chunks</dd></div>
+            <div><dt>v2 Redis</dt><dd>{health.v2?.redis_ok != null ? (health.v2.redis_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+            <div><dt>v2 SQLite</dt><dd>{health.v2?.sqlite_ok != null ? (health.v2.sqlite_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+            <div><dt>v2 Hybrid RAG</dt><dd>{health.v2?.hybrid_rag ? 'on' : 'off'}</dd></div>
+          </dl>
+        )}        </aside>
     </main>
   )
 }
