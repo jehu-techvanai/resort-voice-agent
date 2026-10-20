@@ -302,6 +302,7 @@ export default function Settings({ onChanged }) {
     <main className="settings">
       <nav className="tabs">
         {TABS.map(([k, name]) => <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{name}</button>)}
+        <a className="ghost btn" href="#/conversations">Conversations</a>
         <button className="link" onClick={() => { setToken(''); setAuthed(false) }}>Log out</button>
       </nav>
       {tab === 'persona' && <Persona onSaved={onChanged} />}

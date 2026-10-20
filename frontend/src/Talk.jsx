@@ -390,8 +390,12 @@ export default function Talk({ health }) {
       </section>
 
       <aside className="metrics">
-        <details open={typeof window !== 'undefined' && window.innerWidth > 980}>
-          <summary>Last turn latency</summary>
+        <div className="metrics-header">
+          <details open={typeof window !== 'undefined' && window.innerWidth > 980}>
+            <summary>Last turn latency</summary>
+          </details>
+          <a className="ghost btn" href="#/conversations" style={{ fontSize: '12px', padding: '4px 10px' }}>View all conversations</a>
+        </div>
           {metrics ? (
             <>
               <dl>

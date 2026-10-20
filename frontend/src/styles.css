@@ -94,6 +94,8 @@ input[type=range] { padding: 0; accent-color: var(--lagoon); }
 @keyframes blink { 50% { opacity: .2; } }
 
 .metrics { padding: 16px 18px; position: sticky; top: 16px; }
+.metrics-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.metrics-header summary { cursor: pointer; }
 .metrics summary { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); font-weight: 600; cursor: pointer; margin-bottom: 8px; }
 dl { margin: 0; }
 dl div { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 13px; }
