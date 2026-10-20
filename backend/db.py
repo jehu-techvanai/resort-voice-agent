@@ -127,8 +127,8 @@ class DB:
             "summary": "",
         }
         await self.conn.execute(
-            "INSERT INTO conversations(id,session_id,mode,started,status) VALUES(?,?,?,?,'active')",
-            (row["id"], row["session_id"], row["mode"], now),
+            "INSERT INTO conversations(id,session_id,mode,started,status,summary) VALUES(?,?,?,?,?,?)",
+            (row["id"], row["session_id"], row["mode"], now, "active", ""),
         )
         await self.conn.commit()
         return row
@@ -143,18 +143,29 @@ class DB:
         await self.conn.commit()
         return True
 
-    async def list_conversations(self, limit: int = 50, offset: int = 0, status: str | None = None) -> list[dict]:
+    async def list_conversations(self, limit: int = 50, offset: int = 0, status: str | None = None,
+                                   q: str | None = None, mode: str | None = None) -> list[dict]:
         assert self.conn
-        q = "SELECT id,session_id,mode,started,ended,total_seconds,status,summary FROM conversations"
+        qsql = "SELECT id,session_id,mode,started,ended,total_seconds,status,summary FROM conversations"
         params: list[Any] = []
+        where = []
         if status:
-            q += " WHERE status=? ORDER BY started DESC"
+            where.append("status=?")
             params.append(status)
+        if mode:
+            where.append("mode=?")
+            params.append(mode)
+        if q:
+            where.append("(id LIKE ? OR session_id LIKE ? OR summary LIKE ? OR mode LIKE ?)")
+            like = f"%{q}%"
+            params.extend([like, like, like, like])
+        if where:
+            qsql += " WHERE " + " AND ".join(where) + " ORDER BY started DESC"
         else:
-            q += " ORDER BY started DESC"
-        q += " LIMIT ? OFFSET ?"
+            qsql += " ORDER BY started DESC"
+        qsql += " LIMIT ? OFFSET ?"
         params.extend([limit, offset])
-        rows = await self.conn.execute_fetchall(q, params)
+        rows = await self.conn.execute_fetchall(qsql, params)
         return [dict(r) for r in rows]
 
     async def get_conversation(self, conversation_id: str) -> dict | None:
@@ -226,6 +237,34 @@ class DB:
         )
         await self.conn.commit()
         return row
+
+    async def update_conversation_note(self, conversation_id: str, note: str, summary: str | None = None) -> bool:
+        assert self.conn
+        fields = []
+        vals = []
+        if note != "":
+            fields.append("summary=?")
+            vals.append(note[:500])
+        if summary is not None:
+            if not fields:
+                fields.append("summary=?")
+            vals.append(summary[:500])
+        if not fields:
+            return False
+        vals.append(conversation_id)
+        await self.conn.execute(
+            f"UPDATE conversations SET {', '.join(fields)} WHERE id=?", vals,
+        )
+        await self.conn.commit()
+        return True
+
+    async def list_contacts(self, conversation_id: str) -> list[dict]:
+        assert self.conn
+        rows = await self.conn.execute_fetchall(
+            "SELECT id,name,phone,captured_at,status FROM contacts WHERE conversation_id=? ORDER BY captured_at",
+            (conversation_id,),
+        )
+        return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- unanswered (v2 mirror)
     async def log_unanswered_v2(

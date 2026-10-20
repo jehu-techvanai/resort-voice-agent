@@ -392,10 +392,11 @@ async def metrics():
 
 @app.get("/api/admin/conversations", dependencies=[Depends(require_admin)])
 async def conversations(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
-                        status: str | None = Query(None)):
+                        status: str | None = Query(None), q: str | None = Query(None),
+                        mode: str | None = Query(None)):
     if not db.conn:
         raise HTTPException(503, "sqlite not enabled")
-    rows = await db.list_conversations(limit=limit, offset=offset, status=status)
+    rows = await db.list_conversations(limit=limit, offset=offset, status=status, q=q, mode=mode)
     return {"ok": True, "rows": rows, "limit": limit, "offset": offset}
 
 
@@ -407,7 +408,27 @@ async def conversation_turns(conversation_id: str):
     if not conv:
         raise HTTPException(404, "conversation not found")
     turns = await db.list_turns(conversation_id)
-    return {"ok": True, "conversation": conv, "turns": turns}
+    contacts = await db.list_contacts(conversation_id)
+    return {"ok": True, "conversation": conv, "turns": turns, "contacts": contacts}
+
+
+@app.patch("/api/admin/conversations/{conversation_id}/note", dependencies=[Depends(require_admin)])
+async def conversation_note(conversation_id: str, body: dict):
+    if not db.conn:
+        raise HTTPException(503, "sqlite not enabled")
+    conv = await db.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    note = body.get("note", "")
+    summary = body.get("summary", None)
+    if not isinstance(note, str):
+        note = str(note or "")
+    if summary is not None and not isinstance(summary, str):
+        summary = None
+    ok = await db.update_conversation_note(conversation_id, note, summary)
+    if not ok:
+        raise HTTPException(400, "note update returned no changes")
+    return {"ok": True}
 
 
 @app.get("/api/admin/conversations/{conversation_id}/export", dependencies=[Depends(require_admin)])

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import Talk from './Talk.jsx'
 import Settings from './Settings.jsx'
+import Conversations from './Conversations.jsx'
 
 function useHashRoute() {
   const [route, setRoute] = useState(() => location.hash.replace(/^#\/?/, '') || 'talk')
@@ -25,17 +26,20 @@ export default function App() {
     <div className="page">
       <header>
         <div>
-          <p className="eyebrow">{route === 'settings' ? 'Settings' : 'Front desk · voice agent'}</p>
+          <p className="eyebrow">{route === 'settings' ? 'Settings' : route === 'conversations' ? 'Conversations' : 'Front desk · voice agent'}</p>
           <h1>{health?.resort || 'Voice agent'}</h1>
         </div>
         <nav className="top">
-          {route === 'settings'
+          {route === 'settings' || route === 'conversations'
             ? <a className="ghost btn" href="#/">Back to agent</a>
-            : <a className="ghost btn" href="#/settings">Settings</a>}
+            : <><a className="ghost btn" href="#/settings">Settings</a>
+                 <a className="ghost btn" href="#/conversations">Conversations</a></>}
         </nav>
       </header>
       {err && <p className="error">{err}</p>}
-      {route === 'settings' ? <Settings onChanged={refresh} /> : <Talk key={health?.agent || 'x'} health={health} />}
+      {route === 'settings' ? <Settings onChanged={refresh} />
+       : route === 'conversations' ? <Conversations />
+       : <Talk key={health?.agent || 'x'} health={health} />}
     </div>
   )
 }
