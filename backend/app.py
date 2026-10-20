@@ -472,6 +472,47 @@ async def unanswered_list_update(entry_id: str, resolved: bool = Query(True)):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- transcript / agent log files
+
+@app.get("/api/admin/log-files", dependencies=[Depends(require_admin)])
+async def log_files():
+    """List available transcript and agent log files in DATA_DIR."""
+    from store import DATA_DIR
+    import re
+    files = []
+    if not DATA_DIR.exists():
+        return {"ok": True, "files": []}
+    pattern = re.compile(r"^(transcript|agent_log)-(.+)\.txt$")
+    for p in sorted(DATA_DIR.iterdir(), key=lambda x: x.name):
+        if p.is_file():
+            m = pattern.match(p.name)
+            if m:
+                files.append({"name": p.name, "type": m.group(1), "tag": m.group(2), "size": p.stat().st_size})
+    return {"ok": True, "files": files}
+
+
+@app.get("/api/admin/log-files/{filename}/content", dependencies=[Depends(require_admin)])
+async def log_file_content(filename: str):
+    """Return the raw content of a transcript or agent log file."""
+    from store import DATA_DIR
+    path = DATA_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, f"File not found: {filename}")
+    return {"ok": True, "filename": filename, "content": path.read_text(encoding="utf-8")}
+
+
+@app.get("/api/admin/log-files/{filename}/download", dependencies=[Depends(require_admin)])
+async def log_file_download(filename: str):
+    """Download a transcript or agent log file."""
+    from store import DATA_DIR
+    path = DATA_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, f"File not found: {filename}")
+    return PlainTextResponse(path.read_text(encoding="utf-8"),
+                            media_type="text/plain",
+                            headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
 @app.get("/api/admin/health/dependencies", dependencies=[Depends(require_admin)])
 async def dependency_health():
     redis_ok = False

@@ -32,6 +32,7 @@ DEFAULTS = {
     "agent_name": config.AGENT_NAME,
     "business_type": "resort",
     "greeting": "Hi, this is {agent} from {business}. How can I help you?",
+    "goodbye_text": "Thank you for calling {business}. Have a wonderful day! Goodbye.",
     "fallback_text": "I'm sorry, I cannot answer that. But I can log that for you and have my boss call you back.",
     "extra_instructions": "",
     "voice": config.TTS_VOICE,

@@ -204,10 +204,11 @@ def build_capability_text() -> str:
 
 # ---------------------------------------------------------------- v2 system prompt wrapper
 
-def system_prompt_v2(settings: dict, context: list, user_text: str) -> str:
+def system_prompt_v2(settings: dict, context: list, user_text: str, greeted: bool = False,
+                     prev_answer: str | None = None) -> str:
     """Extend the existing system_prompt with capability list and guardrail hints."""
     from session import system_prompt as base_prompt
-    base = base_prompt(settings, context)
+    base = base_prompt(settings, context, greeted=greeted, prev_answer=prev_answer)
     caps = build_capability_text()
     extra = []
     if caps:
@@ -220,6 +221,11 @@ def system_prompt_v2(settings: dict, context: list, user_text: str) -> str:
     extra.append(
         "If you do not know the answer from INFO, say exactly UNKNOWN. Do not invent prices, "
         "dates, availability, or policies. For numbers you cite, prefer ones visible in INFO."
+    )
+    extra.append(
+        "NEVER repeat your name or the business name in every reply. Only introduce yourself on "
+        "the very first greeting. After that, answer directly without saying who you are or where "
+        "you work every time."
     )
     if extra:
         base = base.rstrip() + "\n\n" + "\n".join(extra)

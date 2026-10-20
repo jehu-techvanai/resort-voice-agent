@@ -38,8 +38,12 @@ HALLUCINATIONS = {
 WAKE_PREFIXES = {"hey", "hi", "hello", "ok", "okay", "oh", "excuse", "me", "so"}
 SMALLTALK = re.compile(r"^(hi|hello|hey|good (morning|afternoon|evening)|thanks?|thank you|ok(ay)?|yes|no|yeah|"
                        r"bye|goodbye|great|cool|fine|sure|alright|who are you|what is your name|how are you)\b", re.I)
+
+# Greetings that should wake the agent even without the calling name (user doesn't know the name yet).
+# Includes closing 인사를 so "bye" can also wake the session for a proper goodbye.
+GREETINGS = re.compile(r"^(hi|hello|hey|good (morning|afternoon|evening|day)|yo|what'?s up|howdy|welcome|bye|goodbye)\b", re.I)
 DECLINE = re.compile(r"\b(no( thanks?| thank you)?|not now|don'?t|do not|never ?mind|skip|no need)\b", re.I)
-QUESTION_START = re.compile(r"^(and |also |so |but )?(what|how|is|are|do|does|can|could|where|when|which|who|why|will|would|tell)\b", re.I)
+QUESTION_START = re.compile(r"^(?:and |also |so |but |okay,? |ok,? |well,? |right,? )?\s*(what|how|is|are|do|does|can|could|where|when|which|who|why|will|would|tell)\b", re.I)
 NUM_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
              "six": "6", "seven": "7", "eight": "8", "nine": "9"}
 
@@ -84,6 +88,12 @@ def match_wake(text: str, name: str) -> tuple[bool, str]:
                 rest = " ".join(words[:j]).rstrip(" ,.!?-")
                 tail = words[-1][-1] if words[-1][-1] in "?!." else ""
                 return True, rest + tail
+    # Accept common greetings even without the calling name — the caller may not know the agent's name yet.
+    if GREETINGS.match(text.strip()):
+        return True, text
+    # Also accept direct questions as a valid wake-up — the caller may just want an answer.
+    if QUESTION_START.match(text.strip()):
+        return True, text
     return False, text
 
 
@@ -133,9 +143,34 @@ def stt_hints(settings: dict) -> list[str]:
     return [settings["agent_name"], settings["business_name"]] + _HINTS["words"]
 
 
-def system_prompt(settings: dict, context: list) -> str:
+def system_prompt(settings: dict, context: list, greeted: bool = False,
+                 prev_answer: str | None = None) -> str:
     facts = "\n\n".join(f"[{c.title}]\n{c.text}" for c, _ in context) or "(nothing relevant found)"
     extra = settings.get("extra_instructions", "").strip()
+    intro_rule = (
+        "Introduce yourself by name and business on this first greeting. "
+        "Say something warm and welcoming."
+        if not greeted
+        else
+        "You have already greeted the caller earlier in this conversation. "
+        "Do NOT re-introduce yourself or say the business name again. "
+        "Answer directly and naturally without repeating who you are."
+    )
+    repeat_rule = (
+        "*** IMPORTANT: You have already answered the following in this conversation. "
+        "If the customer's new message is a follow-up, thank-you, or vague reference to what you "
+        "already said, do NOT repeat the full answer. Just acknowledge briefly. ***\n"
+        "You already said: " + prev_answer + "\n"
+        "If the customer asks something you already answered in this conversation, "
+        "do NOT repeat the full answer word for word. Instead, briefly confirm what you said "
+        "or add a small new detail. For example, if you already said the resort is in Kerala, "
+        "and they ask again, say something like 'As I mentioned, it's in Kerala, on Lighthouse Beach in Kovalam.' "
+        "Never copy-paste your previous reply."
+        if prev_answer
+        else
+        "If the customer asks something you already answered, do NOT repeat the full answer. "
+        "Briefly confirm and add a small new detail instead."
+    )
     return f"""You are {settings['agent_name']}, the receptionist at {settings['business_name']}, a {settings.get('business_type') or 'business'}. You are speaking to a customer, so your words will be read aloud.
 
 Rules:
@@ -145,6 +180,8 @@ Rules:
 - Keep each reply to one to three short sentences. No lists, no markdown, no emojis, no symbols like the rupee sign; say "rupees".
 - You cannot confirm bookings or check live availability. If the customer wants to book, ask for their name, dates and number of guests, and say the team will confirm.
 - Be warm and natural. Ask one short follow-up question when it helps.
+- {intro_rule}
+- {repeat_rule}
 {('- ' + extra) if extra else ''}
 INFO:
 {facts}"""
@@ -175,12 +212,19 @@ class Session:
         self.heard_upto: dict[int, int] = {}
         self.recent_agent_text: list[str] = []
         self.decide_lock = asyncio.Lock()
+        # Last assistant reply, so the system prompt can tell the LLM not to repeat it.
+        self._last_answer: str = ""
+        # Per-conversation transcript and agent log file paths.
+        self.transcript_path: Path | None = None
+        self.agent_log_path: Path | None = None
         # v2: durable conversation row (filled on first accepted turn when db is available)
         self.conversation_id: str | None = None
         self.started_at: float = 0.0
         # Redis session store (may be None)
         self.redis_store = ENGINES.get("redis_session")
         self.db = ENGINES.get("db")
+        # Greeting state: once the agent has greeted the caller, don't re-greet on every "hello".
+        self._greeted: bool = False
 
     # ------------------------------------------------------------ helpers
     @property
@@ -250,19 +294,26 @@ class Session:
             return await self.send({"type": "ignored", "utt": utt, "reason": reason, "text": text})
 
         async with self.decide_lock:
-            woke_now = False
-            if self.wake and not self.awake():
-                ok, rest = match_wake(text, self.settings["agent_name"])
-                if not ok:
-                    return await self.send({"type": "ignored", "utt": utt, "reason": "no calling name", "text": text})
-                text, woke_now = rest, True
-            elif self.wake:
-                ok, rest = match_wake(text, self.settings["agent_name"])
-                if ok and rest:
-                    text = rest
-            non_english = tr.language != "en" and tr.language_prob >= config.NON_ENGLISH_THRESHOLD
-            await self.start_turn(text, utt=utt, t0=t0, stt_ms=stt_ms, non_english=non_english,
-                                  greet_only=woke_now and not _norm(text))
+                woke_now = False
+                if self.wake and not self.awake():
+                    # Dynamic wake decision: ask the LLM whether this is a genuine utterance.
+                    # Falls back to match_wake (calling name / greetings / questions) if LLM is busy.
+                    ok, rest, dynamic = await self._dynamic_wake_check(text)
+                    if not ok:
+                        return await self.send({"type": "ignored", "utt": utt, "reason": "no calling name", "text": text})
+                    text, woke_now = rest, True
+                    if dynamic:
+                        _log = __import__("logging").getLogger("session")
+                        _log.debug("dynamic wake accepted: %r", text)
+                elif self.wake:
+                    ok, rest = match_wake(text, self.settings["agent_name"])
+                    if ok and rest:
+                        text = rest
+                non_english = tr.language != "en" and tr.language_prob >= config.NON_ENGLISH_THRESHOLD
+                # A pure greeting (no calling name removed, just a greeting word) gets the formal greeting.
+                is_pure_greeting = woke_now and SMALLTALK.match(text.strip()) and len(text.strip().split()) <= 2
+                await self.start_turn(text, utt=utt, t0=t0, stt_ms=stt_ms, non_english=non_english,
+                                      greet_only=is_pure_greeting)
 
     async def on_text(self, text: str):
         self.utt_no += 1
@@ -293,8 +344,41 @@ class Session:
         self.pending_contact = None
         self.awake_until = 0
         self.speaking_turn = None
+        self._greeted = False
+        self._last_answer = ""
+        self.transcript_path = None
+        self.agent_log_path = None
         await self._sync_session_state()
         await self.send_state()
+
+    # ------------------------------------------------------------ transcript / agent log
+
+    def _ensure_log_files(self):
+        """Create per-conversation transcript.txt and agent_log.txt in DATA_DIR."""
+        if self.transcript_path is not None:
+            return
+        from store import DATA_DIR
+        tag = f"{self.conversation_id or self.id}-{time.strftime('%Y%m%d-%H%M%S')}"
+        self.transcript_path = DATA_DIR / f"transcript-{tag}.txt"
+        self.agent_log_path = DATA_DIR / f"agent_log-{tag}.txt"
+        header = f"# Conversation transcript — {time.strftime('%Y-%m-%d %H:%M:%S')} | session={self.id}\n"
+        self.transcript_path.write_text(header, encoding="utf-8")
+        self.agent_log_path.write_text(header, encoding="utf-8")
+
+    def _log_transcript(self, role: str, text: str):
+        self._ensure_log_files()
+        line = f"{'=' * 40}\n[{time.strftime('%H:%M:%S')}] {role.upper()}: {text}\n{'=' * 40}\n"
+        with open(self.transcript_path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+    def _log_agent(self, role: str, text: str, extra: str = ""):
+        self._ensure_log_files()
+        line = f"[{time.strftime('%H:%M:%S')}] {role}: {text}"
+        if extra:
+            line += f"  ||  {extra}"
+        line += "\n"
+        with open(self.agent_log_path, "a", encoding="utf-8") as f:
+            f.write(line)
 
     # ------------------------------------------------------------ v2 session sync
 
@@ -306,6 +390,47 @@ class Session:
         except Exception as e:
             _log = __import__("logging").getLogger("session")
             _log.debug("v2 session sync skipped: %s", e)
+
+    async def _dynamic_wake_check(self, text: str) -> tuple[bool, str, bool]:
+        """Ask the LLM whether *text* is a genuine customer utterance worth waking for.
+
+        Returns (ok, rest, dynamic):
+        - ok=True means wake the session; rest is text with calling name stripped if found.
+        - dynamic=True means the LLM made the decision (not a hardcoded regex).
+
+        Falls back to match_wake if the LLM is not available or times out.
+        """
+        # First try the fast hardcoded path (calling name, greetings, questions).
+        ok, rest = match_wake(text, self.settings["agent_name"])
+        if ok:
+            return ok, rest, False
+
+        # Dynamic path: ask the LLM.
+        try:
+            llm = ENGINES.get("llm")
+            if not llm:
+                return ok, rest, False
+            s = self.settings
+            prompt = (
+                f"You are {s['agent_name']}, a receptionist at {s['business_name']}. "
+                f"A customer just said this while the agent was asleep: \"" + text + "\"\n"
+                "Is this a genuine customer utterance that deserves a reply? "
+                "This means a real question, request, greeting, statement, or anything a human would actually say to a receptionist. "
+                "NOT noise, echo, random sounds, or a few meaningless words.\n"
+                "Reply with exactly ONE word: YES or NO. Nothing else.\n"
+            )
+            resp = await asyncio.wait_for(
+                llm.complete([{"role": "user", "content": prompt}], max_tokens=4),
+                timeout=3.0,
+            )
+            decision = resp.strip().upper()
+            if decision.startswith("YES"):
+                return True, text, True
+            return False, text, True
+        except Exception:
+            return ok, rest, False
+
+
 
     def _state_dict(self) -> dict:
         return {
@@ -341,6 +466,9 @@ class Session:
         turn = self.turn_no
         self.extend_awake()
         await self.send({"type": "accepted", "utt": utt, "turn": turn, "text": text})
+        # Log user utterance to transcript and agent log
+        self._log_transcript("user", text)
+        self._log_agent("user", text, f"utt={utt} stt_ms={stt_ms} non_english={non_english}")
         # v2: begin durable conversation on first accepted turn
         if not self.conversation_id and self.db:
             try:
@@ -372,11 +500,24 @@ class Session:
         timings = {"stt_ms": stt_ms}
         sources, unknown = [], False
         try:
-            if greet_only:
+            # End-of-session greeting: use the configured goodbye text from settings.
+            if SMALLTALK.match(user_text.strip()) and user_text.strip().lower() in ("bye", "goodbye"):
+                goodbye = s.get("goodbye_text", "Goodbye! Have a nice day.")
+                await self.speak(turn, [goodbye], t0, timings)
+                self.history += [{"role": "user", "content": user_text}, {"role": "assistant", "content": goodbye}]
+                self._greeted = True
+                return await self.finish(turn, t0, timings, sources)
+
+            # First greeting: deliver the formal greeting once per session.
+            if not self._greeted and greet_only:
                 g = s["greeting"].format(agent=s["agent_name"], business=s["business_name"])
                 await self.speak(turn, [g], t0, timings)
                 self.history += [{"role": "assistant", "content": g}]
+                self._greeted = True
                 return await self.finish(turn, t0, timings, sources)
+            # Already greeted: treat any pure greeting as small talk (LLM handles it briefly).
+            if greet_only and self._greeted:
+                greet_only = False
             if non_english:
                 await self.speak(turn, [ENGLISH_ONLY_REPLY], t0, timings)
                 return await self.finish(turn, t0, timings, sources)
@@ -387,6 +528,11 @@ class Session:
                 handled = await self.contact_step(turn, user_text, t0, timings)
                 if handled:
                     return await self.finish(turn, t0, timings, sources)
+
+            # If the caller woke us with a greeting that also has a question, mark as greeted so we
+            # don't repeat the formal greeting on later turns.
+            if not self._greeted and greet_only is False and SMALLTALK.match(user_text.strip()):
+                self._greeted = True
 
             # retrieval
             tr0 = time.perf_counter()
@@ -419,11 +565,13 @@ class Session:
     async def llm_reply(self, turn, user_text, context, t0, timings) -> bool:
         """Stream the LLM reply into TTS. Returns True if the model said it does not know."""
         s = self.settings
-        # v2: use capability-aware system prompt when enabled
+        # Pass greeting state and the last answer so the LLM avoids repetition.
         if config.V2_RAG:
-            prompt_text = system_prompt_v2(s, context, user_text)
+            prompt_text = system_prompt_v2(s, context, user_text, greeted=self._greeted,
+                                           prev_answer=self._last_answer)
         else:
-            prompt_text = system_prompt(s, context)
+            prompt_text = system_prompt(s, context, greeted=self._greeted,
+                                         prev_answer=self._last_answer)
         messages = [{"role": "system", "content": prompt_text}]
         messages += self.history[-config.HISTORY_TURNS * 2:]
         messages.append({"role": "user", "content": user_text})
@@ -502,6 +650,7 @@ class Session:
                         self.turn_sentences[turn].append(note.strip())
                 self.history.append({"role": "assistant", "content": full})
                 self.recent_agent_text += spoken
+                self._last_answer = full   # remember for next turn's repeat-avoidance
             elif state["unknown"]:
                 self.history.pop()   # user line is re-added by handle_unknown
         return state["unknown"] and not spoken
@@ -606,4 +755,12 @@ class Session:
                 _log.debug("v2 add_turn skipped: %s", e)
         await self._sync_session_state()
         await self.send({"type": "done", "turn": turn, "timings": timings, "sources": sources, "unknown": unknown})
+        # Log agent response to transcript and agent log
+        last_assistant = next((m["content"] for m in reversed(self.history) if m["role"] == "assistant"), "")
+        if last_assistant:
+            self._log_transcript("agent", last_assistant)
+            extra = f"turn={turn} total_ms={timings.get('total_ms', 0)} unknown={unknown}"
+            if sources:
+                extra += f" sources={len(sources)}"
+            self._log_agent("agent", last_assistant, extra)
         await self.send_state()

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import Talk from './Talk.jsx'
 import Settings from './Settings.jsx'
 import Conversations from './Conversations.jsx'
+import LogFiles from './LogFiles.jsx'
 
 function useHashRoute() {
   const [route, setRoute] = useState(() => location.hash.replace(/^#\/?/, '') || 'talk')
@@ -39,6 +40,7 @@ export default function App() {
       {err && <p className="error">{err}</p>}
       {route === 'settings' ? <Settings onChanged={refresh} />
        : route === 'conversations' ? <Conversations />
+       : route === 'logs' ? <LogFiles onBack={() => { location.hash = '#/conversations' }} />
        : <Talk key={health?.agent || 'x'} health={health} />}
     </div>
   )

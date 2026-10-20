@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import LogFiles from './LogFiles.jsx'
 
 function getToken() { try { return sessionStorage.getItem('adminToken') || '' } catch { return '' } }
 function setToken(t) { try { t ? sessionStorage.setItem('adminToken', t) : sessionStorage.removeItem('adminToken') } catch { /* ignore */ } }
@@ -130,8 +131,11 @@ export default function Conversations() {
       <nav className="tabs">
         <button className={tab === 'list' ? 'on' : ''} onClick={() => { setTab('list'); setConv(null); setNote('') }}>Conversations</button>
         <button className={tab === 'detail' ? 'on' : ''} disabled={!activeConvId} onClick={() => activeConvId && setTab('detail')}>Detail</button>
+        <button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Log files</button>
         <button className="link" onClick={() => { setToken(''); setAuthed(false) }}>Log out</button>
       </nav>
+
+      {tab === 'logs' && <LogFiles onBack={() => setTab('list')} />}
 
       {tab === 'list' && (
         <div className="conversations-list">
