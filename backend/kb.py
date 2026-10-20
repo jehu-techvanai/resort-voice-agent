@@ -15,7 +15,7 @@ import numpy as np
 
 import config
 import store
-from logging_utils import _log
+from logging_utils import log as _log
 
 KB_DIR = store.DATA_DIR / "kb"
 STAGING = KB_DIR / "staging"
