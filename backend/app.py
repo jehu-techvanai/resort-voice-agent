@@ -1,14 +1,23 @@
-"""Voice agent backend (v0.2).
+"""Voice agent backend (v0.2 + v2 extensions).
 
 WebSocket  /ws?mode=web            hands-free browser session (see session.py for the message protocol)
 REST       /api/admin/...          settings page: persona, knowledge base upload / train / rollback, unanswered log
 REST       /api/health, /api/public/settings
+
+v2 extensions:
+- Redis-backed hot session memory (REDIS_URL) with in-process fallback
+- SQLite durable conversation/turn/contact/unanswered store (SQLITE_DB)
+- Hybrid RAG: BM25 + dense + RRF, optional cross-encoder re-ranker, query expansion
+- Capability/tool scaffold + guardrails
+- Observability: structured logs, metrics, conversation export
 """
 import asyncio
 import csv
 import io
 import json
+import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -20,14 +29,22 @@ import store
 from engines import LLM, STT, TTS
 from kb import KnowledgeBase, ParseError
 from session import ENGINES, Session, system_prompt
+from redis_session import RedisSessionStore
+from db import DB
+from logging_utils import setup_logging
 
-app = FastAPI(title="Voice Agent")
+if config.STRUCTURED_LOGS:
+    setup_logging()
+
+_log = logging.getLogger("app")
+redis_store = RedisSessionStore()
+vet_db = DB()
 
 
-@app.on_event("startup")
-async def load_models():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     t0 = time.perf_counter()
-    print(f"[startup] device={config.DEVICE} mock={config.MOCK}")
+    _log.info("startup device=%s mock=%s", config.DEVICE, config.MOCK)
     ENGINES["stt"] = STT()
     ENGINES["kb"] = KnowledgeBase()
     ENGINES["tts"] = TTS()
@@ -37,9 +54,25 @@ async def load_models():
     await asyncio.get_running_loop().run_in_executor(None, ENGINES["stt"].preload, engine)
     asyncio.create_task(_keep_llm_loaded())
     kb = ENGINES["kb"]
-    print(f"[startup] models ready in {time.perf_counter() - t0:.1f}s, knowledge base {kb.version} "
-          f"with {len(kb.chunks)} chunks")
-    print(f"[startup] settings page: /#/settings   admin password: {store.admin_password()}")
+    _log.info("models ready in %.1fs, knowledge base %s with %d chunks",
+              time.perf_counter() - t0, kb.version, len(kb.chunks))
+    _log.info("settings page: /#/settings   admin password: %s", store.admin_password())
+
+    # v2: redis session store
+    ENGINES["redis_session"] = redis_store
+    await redis_store.open()
+
+    # v2: durable store
+    ENGINES["db"] = vet_db
+    db_ok = await vet_db.open()
+    _log.info("v2 db ok=%s", db_ok)
+    yield
+    # teardown
+    await redis_store.close()
+    await vet_db.close()
+
+
+app = FastAPI(title="Voice Agent", lifespan=lifespan)
 
 
 async def _keep_llm_loaded():
@@ -54,12 +87,43 @@ async def _keep_llm_loaded():
 async def health():
     s = store.load_settings()
     kb = ENGINES.get("kb")
+    redis_ok = False
+    redis_info = None
+    if redis_store.enabled and redis_store.redis:
+        try:
+            redis_ok = await redis_store.redis.ping()
+            redis_info = await redis_store.redis.info("server")
+        except Exception as e:
+            redis_ok = False
+            _log.warning("redis health check failed: %s", e)
+    db_ok = bool(vet_db.conn)
+    metrics = {}
+    if db_ok:
+        try:
+            metrics = await vet_db.aggregate_metrics()
+        except Exception as e:
+            _log.debug("metrics aggregate failed: %s", e)
     return {
-        "ok": True, "mock": config.MOCK, "device": config.DEVICE, "stt": config.STT_MODEL,
-        "embed": config.EMBED_MODEL, "llm": config.LLM_MODEL, "tts": f"kokoro/{s['voice']}",
+        "ok": True,
+        "mock": config.MOCK,
+        "device": config.DEVICE,
+        "stt": config.STT_MODEL,
+        "embed": config.EMBED_MODEL,
+        "llm": config.LLM_MODEL,
+        "tts": f"kokoro/{s['voice']}",
         "stt_engine": s["stt_engine"],
-        "resort": s["business_name"], "agent": s["agent_name"],
-        "kb_version": kb.version if kb else None, "kb_chunks": len(kb.chunks) if kb else 0,
+        "resort": s["business_name"],
+        "agent": s["agent_name"],
+        "kb_version": kb.version if kb else None,
+        "kb_chunks": len(kb.chunks) if kb else 0,
+        "v2": {
+            "redis_url_filled": bool(config.REDIS_URL),
+            "redis_ok": redis_ok,
+            "sqlite_ok": db_ok,
+            "hybrid_rag": config.V2_RAG,
+            "rerank": config.V2_RERANK,
+            "metrics": metrics,
+        },
     }
 
 
@@ -169,6 +233,14 @@ async def put_settings(body: dict):
         saved = store.save_settings(body)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # v2: audit settings change into SQLite when available
+    if vet_db.conn:
+        try:
+            import json as _json
+            changed_fields = {k: v for k, v in body.items() if k in saved}
+            await db.audit_settings("admin_api", changed_fields, saved)
+        except Exception as e:
+            _log.debug("settings audit skipped: %s", e)
     if saved["stt_engine"] != before:
         if saved["stt_engine"] == "sarvam" and not config.SARVAM_API_KEY:
             raise HTTPException(400, "Saved, but Sarvam needs SARVAM_API_KEY in .env (then restart).")
@@ -306,7 +378,109 @@ async def unanswered_csv():
                              headers={"Content-Disposition": "attachment; filename=unanswered.csv"})
 
 
+# ---------------------------------------------------------------- v2 observability
+
+@app.get("/api/admin/metrics", dependencies=[Depends(require_admin)])
+async def metrics():
+    if db.conn:
+        try:
+            return {"ok": True, "metrics": await db.aggregate_metrics()}
+        except Exception as e:
+            raise HTTPException(500, f"metrics error: {e}")
+    return {"ok": True, "metrics": {}, "note": "sqlite not enabled"}
+
+
+@app.get("/api/admin/conversations", dependencies=[Depends(require_admin)])
+async def conversations(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+                        status: str | None = Query(None)):
+    if not db.conn:
+        raise HTTPException(503, "sqlite not enabled")
+    rows = await db.list_conversations(limit=limit, offset=offset, status=status)
+    return {"ok": True, "rows": rows, "limit": limit, "offset": offset}
+
+
+@app.get("/api/admin/conversations/{conversation_id}/turns", dependencies=[Depends(require_admin)])
+async def conversation_turns(conversation_id: str):
+    if not db.conn:
+        raise HTTPException(503, "sqlite not enabled")
+    conv = await db.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    turns = await db.list_turns(conversation_id)
+    return {"ok": True, "conversation": conv, "turns": turns}
+
+
+@app.get("/api/admin/conversations/{conversation_id}/export", dependencies=[Depends(require_admin)])
+async def conversation_export(conversation_id: str, format: str = Query("json", regex="^(json|csv)$")):
+    if not db.conn:
+        raise HTTPException(503, "sqlite not enabled")
+    conv = await db.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    turns = await db.list_turns(conversation_id)
+    if format == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["turn_no", "user_text", "agent_text", "unknown", "retrieval_best_score", "latency_ms", "sources", "created"])
+        for t in turns:
+            w.writerow([t["turn_no"], t["user_text"], t["agent_text"], bool(t["unknown"]),
+                        t["retrieval_best_score"], t["latency_ms"], t["sources"], t["created"]])
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv",
+                                headers={"Content-Disposition": f"attachment; filename=conversation-{conversation_id}.csv"})
+    return {"ok": True, "conversation": conv, "turns": turns}
+
+
+@app.get("/api/admin/unanswered/list", dependencies=[Depends(require_admin)])
+async def unanswered_list(limit: int = Query(100, ge=1, le=500), resolved: bool | None = None,
+                          mode: str | None = None):
+    if not db.conn:
+        # fallback to legacy jsonl path
+        return {"ok": True, "items": store.list_unanswered(), "note": "using legacy unanswered store"}
+    rows = await db.list_unanswered_v2(limit=limit, resolved=resolved, mode=mode)
+    return {"ok": True, "rows": rows}
+
+
+@app.patch("/api/admin/unanswered/list/{entry_id}", dependencies=[Depends(require_admin)])
+async def unanswered_list_update(entry_id: str, resolved: bool = Query(True)):
+    if db.conn:
+        await db.mark_unanswered_resolved(entry_id, resolved)
+        return {"ok": True}
+    # fallback: try legacy update (only supports note/name/phone)
+    if not store.update_unanswered(entry_id, resolved=resolved):
+        raise HTTPException(404, "not found")
+    return {"ok": True}
+
+
+@app.get("/api/admin/health/dependencies", dependencies=[Depends(require_admin)])
+async def dependency_health():
+    redis_ok = False
+    if redis_store.enabled and redis_store.redis:
+        try:
+            redis_ok = await redis_store.redis.ping()
+        except Exception as e:
+            _log.warning("redis health check failed: %s", e)
+    db_ok = bool(db.conn)
+    return {"ok": True, "redis": {"url_filled": bool(config.REDIS_URL), "enabled": redis_store.enabled, "ok": redis_ok},
+            "sqlite": {"path_filled": bool(config.SQLITE_DB), "ok": db_ok}}
+
+
+@app.get("/api/admin/settings/audit", dependencies=[Depends(require_admin)])
+async def settings_audit(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    if not vet_db.conn:
+        return {"ok": True, "rows": [], "note": "sqlite audit store not enabled"}
+    rows = await vet_db.conn.execute_fetchall(
+        "SELECT id, changed_by, fields, changed_at FROM settings_audit ORDER BY changed_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    )
+    out = []
+    for r in rows:
+        fields = json.loads(r["fields"]) if r["fields"] else {}
+        out.append({"id": r["id"], "changed_by": r["changed_by"], "fields": fields, "changed_at": r["changed_at"]})
+    return {"ok": True, "rows": out, "limit": limit, "offset": offset}
+
+
 # ---------------------------------------------------------------- UI
+
 
 _dist = config.BASE_DIR.parent / "frontend" / "dist"
 if _dist.exists():

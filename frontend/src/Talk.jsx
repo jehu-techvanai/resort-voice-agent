@@ -412,6 +412,9 @@ export default function Talk({ health }) {
               <div><dt>LLM</dt><dd>{health.llm}</dd></div>
               <div><dt>Voice</dt><dd>{health.tts}</dd></div>
               <div><dt>Knowledge</dt><dd>{health.kb_version} · {health.kb_chunks} chunks</dd></div>
+              <div><dt>v2 Redis</dt><dd>{health.v2?.redis_ok != null ? (health.v2.redis_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+              <div><dt>v2 SQLite</dt><dd>{health.v2?.sqlite_ok != null ? (health.v2.sqlite_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+              <div><dt>v2 Hybrid RAG</dt><dd>{health.v2?.hybrid_rag ? 'on' : 'off'}</dd></div>
             </dl>
           )}
         </details>

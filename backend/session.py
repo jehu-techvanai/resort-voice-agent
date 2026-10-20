@@ -16,14 +16,16 @@ import json
 import re
 import time
 import uuid
+from typing import Any
 
 import numpy as np
 
 import config
 import store
 from engines import SentenceSplitter, clean_for_speech, pcm16_to_float
+from agent import Guardrails, extract_contact, extract_booking_intent, system_prompt_v2
 
-ENGINES = {}   # filled by app.py at startup: stt, tts, llm, kb
+ENGINES = {}   # filled by app.py at startup: stt, tts, llm, kb, redis_session, db
 
 ENGLISH_ONLY_REPLY = "Sorry, I can only help in English at the moment. Could you please say that again in English?"
 NOT_HEARD_REPLY = "Sorry, I didn't catch that. Could you say it again?"
@@ -173,6 +175,12 @@ class Session:
         self.heard_upto: dict[int, int] = {}
         self.recent_agent_text: list[str] = []
         self.decide_lock = asyncio.Lock()
+        # v2: durable conversation row (filled on first accepted turn when db is available)
+        self.conversation_id: str | None = None
+        self.started_at: float = 0.0
+        # Redis session store (may be None)
+        self.redis_store = ENGINES.get("redis_session")
+        self.db = ENGINES.get("db")
 
     # ------------------------------------------------------------ helpers
     @property
@@ -285,7 +293,31 @@ class Session:
         self.pending_contact = None
         self.awake_until = 0
         self.speaking_turn = None
+        await self._sync_session_state()
         await self.send_state()
+
+    # ------------------------------------------------------------ v2 session sync
+
+    async def _sync_session_state(self):
+        if not self.redis_store:
+            return
+        try:
+            await self.redis_store.save_session(self.id, self._state_dict(), self.history)
+        except Exception as e:
+            _log = __import__("logging").getLogger("session")
+            _log.debug("v2 session sync skipped: %s", e)
+
+    def _state_dict(self) -> dict:
+        return {
+            "turn_no": self.turn_no,
+            "utt_no": self.utt_no,
+            "awake_until": self.awake_until,
+            "speaking_turn": self.speaking_turn,
+            "pending_contact": self.pending_contact,
+            "mode": self.mode,
+            "wake": self.wake,
+            "capture_contact": self.capture_contact,
+        }
 
     # ------------------------------------------------------------ turns
     async def cancel_current(self):
@@ -309,6 +341,15 @@ class Session:
         turn = self.turn_no
         self.extend_awake()
         await self.send({"type": "accepted", "utt": utt, "turn": turn, "text": text})
+        # v2: begin durable conversation on first accepted turn
+        if not self.conversation_id and self.db:
+            try:
+                conv = await self.db.start_conversation(self.id, self.mode)
+                self.conversation_id = conv["id"]
+                self.started_at = time.time()
+            except Exception as e:
+                _log = __import__("logging").getLogger("session")
+                _log.debug("v2 start_conversation skipped: %s", e)
         self.task = asyncio.create_task(self.run_turn(turn, text, t0, stt_ms, non_english, greet_only))
 
     async def speak(self, turn: int, sentences: list[str], t0: float, timings: dict):
@@ -378,7 +419,12 @@ class Session:
     async def llm_reply(self, turn, user_text, context, t0, timings) -> bool:
         """Stream the LLM reply into TTS. Returns True if the model said it does not know."""
         s = self.settings
-        messages = [{"role": "system", "content": system_prompt(s, context)}]
+        # v2: use capability-aware system prompt when enabled
+        if config.V2_RAG:
+            prompt_text = system_prompt_v2(s, context, user_text)
+        else:
+            prompt_text = system_prompt(s, context)
+        messages = [{"role": "system", "content": prompt_text}]
         messages += self.history[-config.HISTORY_TURNS * 2:]
         messages.append({"role": "user", "content": user_text})
         self.history.append({"role": "user", "content": user_text})
@@ -446,7 +492,15 @@ class Session:
             if not producer.done():
                 producer.cancel()
             if spoken:
-                self.history.append({"role": "assistant", "content": " ".join(spoken)})
+                full = " ".join(spoken)
+                # v2 guardrail: append citation note if we cited numbers not in sources
+                if config.V2_RAG and sources:
+                    guard = Guardrails(s, retrieval_best=None)
+                    note = guard.citation_note(full, sources)
+                    if note:
+                        full = full.rstrip() + note
+                        self.turn_sentences[turn].append(note.strip())
+                self.history.append({"role": "assistant", "content": full})
                 self.recent_agent_text += spoken
             elif state["unknown"]:
                 self.history.pop()   # user line is re-added by handle_unknown
@@ -454,6 +508,14 @@ class Session:
 
     async def handle_unknown(self, turn, user_text, t0, timings):
         s = self.settings
+        # v2: also log to SQLite unanswered store when available
+        extra_note = ""
+        if self.db:
+            try:
+                await self.db.log_unanswered_v2(self.conversation_id or "", self.id, self.mode, user_text)
+            except Exception as e:
+                _log = __import__("logging").getLogger("session")
+                _log.debug("v2 log_unanswered_v2 skipped: %s", e)
         entry = store.log_unanswered(user_text, self.id, self.mode)
         lines = [s["fallback_text"]]
         if self.capture_contact:
@@ -520,5 +582,28 @@ class Session:
             self.speaking_turn = None
         self.extend_awake()
         del self.history[: max(0, len(self.history) - config.HISTORY_TURNS * 2)]
+        # v2: durable turn log
+        if self.conversation_id and self.db:
+            try:
+                last_user = next((m["content"] for m in reversed(self.history) if m["role"] == "user"), "")
+                last_assistant = next((m["content"] for m in reversed(self.history) if m["role"] == "assistant"), "")
+                retrieval_best = None
+                for s in (sources or []):
+                    if isinstance(s, dict) and "score" in s and retrieval_best is None:
+                        retrieval_best = float(s["score"])
+                await self.db.add_turn(
+                    self.conversation_id,
+                    turn,
+                    last_user,
+                    last_assistant,
+                    unknown,
+                    retrieval_best or 0.0,
+                    timings.get("total_ms", 0),
+                    sources,
+                )
+            except Exception as e:
+                _log = __import__("logging").getLogger("session")
+                _log.debug("v2 add_turn skipped: %s", e)
+        await self._sync_session_state()
         await self.send({"type": "done", "turn": turn, "timings": timings, "sources": sources, "unknown": unknown})
         await self.send_state()

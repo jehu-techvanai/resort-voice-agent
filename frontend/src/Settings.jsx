@@ -284,7 +284,7 @@ function Unanswered() {
   )
 }
 
-const TABS = [['persona', 'Persona'], ['knowledge', 'Knowledge base'], ['test', 'Test'], ['unanswered', 'Unanswered']]
+const TABS = [['persona', 'Persona'], ['knowledge', 'Knowledge base'], ['test', 'Test'], ['unanswered', 'Unanswered'], ['observability', 'Observability']]
 
 export default function Settings({ onChanged }) {
   const [authed, setAuthed] = useState(!!getToken())
@@ -308,6 +308,131 @@ export default function Settings({ onChanged }) {
       {tab === 'knowledge' && <Knowledge onChanged={onChanged} />}
       {tab === 'test' && <TestBox />}
       {tab === 'unanswered' && <Unanswered />}
+      {tab === 'observability' && <Observability />}
     </main>
+  )
+}
+
+function Observability() {
+  const [health, setHealth] = useState(null)
+  const [metrics, setMetrics] = useState(null)
+  const [deps, setDeps] = useState(null)
+  const [convList, setConvList] = useState(null)
+  const [conv, setConv] = useState(null)
+  const [exportFmt, setExportFmt] = useState('json')
+  const load = async () => {
+    try {
+      const [h, m, d] = await Promise.all([
+        api('/api/health').then((d) => d),
+        api('/api/admin/metrics').then((d) => d),
+        api('/api/admin/health/dependencies').then((d) => d),
+      ])
+      setHealth(h); setMetrics(m); setDeps(d)
+    } catch (e) { setMetrics({error: e.message}) }
+  }
+  const loadConvs = async (limit = 20) => {
+    try { const d = await api(`/api/admin/conversations?limit=${limit}`); setConvList(d) } catch (e) { setConvList({error: e.message}) }
+  }
+  const loadConv = async (id) => {
+    try { const d = await api(`/api/admin/conversations/${id}/turns`); setConv(d) } catch (e) { setConv({error: e.message}) }
+  }
+  const exportConv = async (id, fmt) => {
+    try {
+      const d = await api(`/api/admin/conversations/${id}/export?format=${fmt}`, {raw: true, method: 'GET'})
+      const blob = await d.blob()
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob)
+      a.download = `conversation-${id}.${fmt}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+    } catch (e) { alert(e.message) }
+  }
+  useEffect(() => { load(); loadConvs(20) }, [])
+  if (!health) return <p className="note">Loading observability data…</p>
+  return (
+    <div className="observability">
+      <div className="card">
+        <h3>System health (v2)</h3>
+        <dl className="table">
+          <div><dt>Redis session memory</dt><dd>{health.v2?.redis_ok != null ? (health.v2.redis_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+          <div><dt>SQLite durable store</dt><dd>{health.v2?.sqlite_ok != null ? (health.v2.sqlite_ok ? 'connected' : 'unavailable') : 'n/a'}</dd></div>
+          <div><dt>Hybrid RAG</dt><dd>{health.v2?.hybrid_rag ? 'on (BM25 + dense + RRF)' : 'off (dense only)'}</dd></div>
+          <div><dt>Re-ranker</dt><dd>{health.v2?.rerank ? 'on' : 'off'}</dd></div>
+          <div><dt>Knowledge</dt><dd>{health.kb_version} · {health.kb_chunks} chunks</dd></div>
+          <div><dt>STT engine</dt><dd>{health.stt_engine}</dd></div>
+          <div><dt>LLM</dt><dd>{health.llm}</dd></div>
+          <div><dt>Voice</dt><dd>{health.tts}</dd></div>
+        </dl>
+      </div>
+      <div className="card">
+        <h3>Dependency check</h3>
+        {deps && (
+          <dl className="table">
+            <div><dt>Redis URL filled</dt><dd>{String(deps.redis?.url_filled)}</dd></div>
+            <div><dt>Redis enabled</dt><dd>{String(deps.redis?.enabled)}</dd></div>
+            <div><dt>Redis ok</dt><dd>{String(deps.redis?.ok)}</dd></div>
+            <div><dt>SQLite path filled</dt><dd>{String(deps.sqlite?.path_filled)}</dd></div>
+            <div><dt>SQLite ok</dt><dd>{String(deps.sqlite?.ok)}</dd></div>
+          </dl>
+        )}
+      </div>
+      <div className="card">
+        <h3>Metrics (from SQLite)</h3>
+        {metrics && metrics.metrics && Object.keys(metrics.metrics).length > 0 ? (
+          <dl className="table">
+            {Object.entries(metrics.metrics).map(([k, v]) => (
+              <div key={k}><dt>{k}</dt><dd>{String(v)}</dd></div>
+            ))}
+          </dl>
+        ) : (
+          <p className="note">{metrics?.note || 'No SQLite metrics available.'}</p>
+        )
+      </div>
+      <div className="card">
+        <h3>Conversations (SQLite)</h3>
+        <div className="row">
+          <button className="ghost" onClick={() => loadConvs(20)}>Refresh</button>
+          <div className="note">{convList?.rows?.length != null ? convList.rows.length + ' conversations' : ''}</div>
+        </div>
+        {convList && convList.rows && convList.rows.length > 0 ? (
+          <table className="table">
+            <thead><tr><th>Conversation</th><th>Mode</th><th>Started</th><th>Status</th><th /></tr></thead>
+            <tbody>
+              {convList.rows.map((c) => (
+                <tr key={c.id}>
+                  <td>{c.id}</td><td>{c.mode}</td><td>{c.started}</td><td>{c.status}</td>
+                  <td><button className="ghost" onClick={() => loadConv(c.id)}>View turns</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="note">No conversations stored yet (SQLite may be disabled).</p>
+        )}
+        {conv && conv.turns && (
+          <div className="card" style={{marginTop: 12}}>
+            <h3>Conversation {conv.conversation.id} — turns</h3>
+            <div className="row">
+              <label>Export format
+                <select value={exportFmt} onChange={(e) => setExportFmt(e.target.value)}>
+                  <option value="json">JSON</option>
+                  <option value="csv">CSV</option>
+                </select>
+              </label>
+              <button className="ghost" onClick={() => exportConv(conv.conversation.id, exportFmt)}>Download export</button>
+            </div>
+            <table className="table">
+              <thead><tr><th>Turn</th><th>User</th><th>Agent</th><th>Unknown</th><th>Score</th><th>Latency ms</th><th>Created</th></tr></thead>
+              <tbody>
+                {conv.turns.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.turn_no}</td><td>{t.user_text}</td><td>{t.agent_text}</td>
+                    <td>{String(Boolean(t.unknown))}</td><td>{t.retrieval_best_score}</td>
+                    <td>{t.latency_ms}</td><td>{t.created}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
   )
 }

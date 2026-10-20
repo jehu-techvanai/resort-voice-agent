@@ -73,8 +73,25 @@ MIN_UTTERANCE_SEC = float(_env("MIN_UTTERANCE_SEC", "0.4"))
 MIN_RMS = float(_env("MIN_RMS", "0.006"))
 NO_SPEECH_PROB = float(_env("NO_SPEECH_PROB", "0.6"))
 
+# v2 observability
+STRUCTURED_LOGS = _env("STRUCTURED_LOGS", "1") == "1"
+
 # ---- v0.3: speech-to-text choice
 STT_ENGINE = _env("STT_ENGINE", "whisper-small")      # whisper-small | whisper-medium | whisper-large-v3-turbo | sarvam
 SARVAM_API_KEY = _env("SARVAM_API_KEY", "")
 SARVAM_MODEL = _env("SARVAM_MODEL", "saaras:v4")
 SARVAM_LANGUAGE = _env("SARVAM_LANGUAGE", "unknown")   # unknown = detect (needed for the English check); or en-IN
+
+# ---- v2: session memory (Redis) + persistence (SQLite) + hybrid RAG
+REDIS_URL = _env("REDIS_URL", "")
+SQLITE_DB = Path(_env("SQLITE_DB", str(DATA_DIR / "v2.db")))
+V2_RAG = _env("V2_RAG", "1") == "1"
+V2_RERANK = _env("V2_RERANK", "0") == "1"
+V2_RRF_K = int(_env("V2_RRF_K", "60"))
+V2_TOP_DENSE = int(_env("V2_TOP_DENSE", "8"))
+V2_TOP_BM25 = int(_env("V2_TOP_BM25", "8"))
+V2_RERANK_TOP = int(_env("V2_RERANK_TOP", "12"))
+V2_QUERY_EXPANSION = _env("V2_QUERY_EXPANSION", "1") == "1"
+V2_SYNONYMS = Path(_env("V2_SYNONYMS", str(BASE_DIR / "knowledge" / "synonyms.json")))
+# session state TTL in seconds (Redis + in-process fallback)
+V2_SESSION_TTL_SEC = int(_env("V2_SESSION_TTL_SEC", "1800"))

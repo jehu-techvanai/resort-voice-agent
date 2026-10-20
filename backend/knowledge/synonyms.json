@@ -1,0 +1,21 @@
+{
+  "resort": ["hotel", "property", "palace", "beach resort"],
+  "pool": ["plunge pool", "swimming pool", "infinity pool"],
+  "villa": ["pool villa", "standalone villa"],
+  "suite": ["family suite", "deluxe suite"],
+  "room": ["accommodation", "cottage", "unit"],
+  "transfer": ["pickup", "drop", "airport transfer", "airport pickup"],
+  "spa": ["ayurveda", "massage", "sukham", "treatment"],
+  "dinner": ["meal", "dining", "restaurant", "kadal", "thira"],
+  "wifi": ["wi-fi", "internet", "free wifi", "high-speed internet"],
+  "parking": ["free parking", "car park"],
+  "gym": ["fitness", "24-hour gym", "workout"],
+  "beach": ["lighthouse beach", "sea", "shore"],
+  "checkin": ["check-in", "arrival", "early check-in"],
+  "checkout": ["check-out", "departure", "late check-out"],
+  "price": ["rates", "cost", "fee", "tariff", "how much"],
+  "pet": ["pets", "dog", "cat", "animal"],
+  "wedding": ["event", "function", "party", "beach lawn", "lagoon hall"],
+  "kovalam": ["kovalam beach", "trivandrum", "trivandrum airport"],
+  "trivandrum": ["tvm", "thiruvananthapuram", "trivandrum airport"]
+}

@@ -9,11 +9,13 @@ import threading
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 import config
 import store
+from logging_utils import _log
 
 KB_DIR = store.DATA_DIR / "kb"
 STAGING = KB_DIR / "staging"
@@ -27,6 +29,13 @@ class Chunk:
     title: str
     text: str
     source: str
+    # v2 metadata for filtering / explainability
+    section: str = ""
+    tags: list[str] = None  # type: ignore
+
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
 
 
 class ParseError(Exception):
@@ -274,6 +283,8 @@ class KnowledgeBase:
         self.version = None
         self.chunks: list[Chunk] = []
         self.matrix = None
+        # v2: BM25 index per active version
+        self.bm25 = None
         self._ensure_initial()
         active = store.load_settings().get("active_kb")
         versions = [v["version"] for v in self.list_versions()]
@@ -286,6 +297,164 @@ class KnowledgeBase:
         with self.lock:
             return self.model.encode([f"{c.title}. {c.text}" for c in chunks], normalize_embeddings=True,
                                      batch_size=32, show_progress_bar=False).astype(np.float32)
+
+    # --- v2 BM25
+    def _build_bm25(self, chunks: list[Chunk]):
+        if not config.V2_RAG or config.MOCK:
+            self.bm25 = None
+            return
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            _log.warning("rank_bm25 not installed; skipping BM25 index")
+            self.bm25 = None
+            return
+        tokenized = [self._tokenize(c.title + " " + c.text) for c in chunks]
+        self.bm25 = BM25Okapi(tokenized)
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return re.findall(r"[a-z0-9]{2,}", text.lower())
+
+    def _bm25_search(self, query: str, k: int) -> list[tuple[Chunk, float]]:
+        if not self.bm25 or not query:
+            return []
+        scores = self.bm25.get_scores(self._tokenize(query))
+        order = sorted(range(len(scores)), key=lambda i: -scores[i])[:k]
+        return [(self.chunks[i], float(scores[i])) for i in order if scores[i] > 0]
+
+    # --- v2 query expansion
+    def _expand_query(self, query: str) -> str:
+        if not config.V2_QUERY_EXPANSION or len(query.split()) >= 6:
+            return query
+        terms = set(self._tokenize(query))
+        synonyms = {}
+        if config.V2_SYNONYMS.exists():
+            try:
+                synonyms = json.loads(config.V2_SYNONYMS.read_text())
+            except Exception:
+                synonyms = {}
+        for t in list(terms):
+            for syn in synonyms.get(t, []):
+                terms.add(syn.lower())
+        # add nearest KB heading terms as expansion context
+        for c in self.chunks[:60]:
+            for w in self._tokenize(c.title):
+                if len(w) > 3:
+                    terms.add(w)
+        if not terms:
+            return query
+        # keep original query first, then expansion terms
+        expanded = query + ". " + " ".join(sorted(terms))
+        return expanded
+
+    # --- v2 hybrid search entry point
+    def search(self, query: str, k: int = None, filters: dict | None = None) -> list[tuple[Chunk, float]]:
+        k = k or config.TOP_K
+        if not query or not self.chunks:
+            return []
+        if config.MOCK:
+            return self._search_mock(query, k)
+        effective = self._expand_query(query) if config.V2_QUERY_EXPANSION else query
+        if config.V2_RAG:
+            return self._search_hybrid(effective, k, filters)
+        # fallback to original dense-only path
+        return self._search_dense(query, k)
+
+    def _search_dense(self, query: str, k: int) -> list[tuple[Chunk, float]]:
+        qv = self.model.encode([self.QUERY_PREFIX + query], normalize_embeddings=True)[0]
+        scores = self.matrix @ qv
+        order = np.argsort(-scores)[:k]
+        return [(self.chunks[i], float(scores[i])) for i in order]
+
+    def _search_hybrid(self, query: str, k: int, filters: dict | None = None) -> list[tuple[Chunk, float]]:
+        # dense
+        qv = self.model.encode([self.QUERY_PREFIX + query], normalize_embeddings=True)[0]
+        scores = self.matrix @ qv
+        dense: list[tuple[Chunk, float]] = []
+        order = np.argsort(-scores)
+        for i in order:
+            c = self.chunks[i]
+            if filters and not self._matches_filters(c, filters):
+                continue
+            dense.append((c, float(scores[i])))
+            if len(dense) >= config.V2_TOP_DENSE:
+                break
+        # bm25
+        bm25 = self._bm25_search(query, config.V2_TOP_BM25)
+        if filters:
+            bm25 = [(c, s) for c, s in bm25 if self._matches_filters(c, filters)][: config.V2_TOP_BM25]
+        # RRF
+        fused: dict[str, list[float]] = {}
+        for rank_i, (c, _) in enumerate(dense):
+            fused.setdefault(c.id, []).append(1.0 / (config.V2_RRF_K + rank_i + 1))
+        for rank_i, (c, _) in enumerate(bm25):
+            fused.setdefault(c.id, []).append(1.0 / (config.V2_RRF_K + rank_i + 1))
+        ranked = sorted(fused.items(), key=lambda x: -sum(x[1]))
+        out = []
+        for cid, _ in ranked:
+            c = next((x for x in self.chunks if x.id == cid), None)
+            if c is None:
+                continue
+            out.append((c, 0.0))
+            if len(out) >= (config.V2_RERANK_TOP or k):
+                break
+        # optional re-rank
+        if config.V2_RERANK and out:
+            out = self._rerank(query, out)
+        else:
+            # use max(dense, bm25) as the fused score
+            dmap = {c.id: s for c, s in dense}
+            bmap = {c.id: s for c, s in bm25}
+            out = [(c, max(dmap.get(c.id, 0.0), bmap.get(c.id, 0.0))) for c, _ in out]
+        return out[:k]
+
+    def _rerank(self, query: str, candidates: list[tuple[Chunk, float]]) -> list[tuple[Chunk, float]]:
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError:
+            return candidates
+        reranker = getattr(self, "_reranker", None)
+        if reranker is None:
+            try:
+                self._reranker = CrossEncoder(config.EMBED_MODEL, device=config.DEVICE)
+            except Exception as e:
+                _log.warning("v2 re-ranker init failed: %s", e)
+                self._reranker = None
+        if not self._reranker:
+            return candidates
+        pairs = [[query, f"{c.title}. {c.text}"] for c, _ in candidates]
+        try:
+            rs = self._reranker.predict(pairs)
+        except Exception as e:
+            _log.warning("v2 rerank predict failed: %s", e)
+            return candidates
+        return [(c, float(rs[i])) for i, (c, _) in enumerate(candidates)]
+
+    @staticmethod
+    def _matches_filters(c: Chunk, filters: dict | None) -> bool:
+        if not filters:
+            return True
+        if "source" in filters and c.source != filters["source"]:
+            return False
+        if "section" in filters and c.section and c.section != filters["section"]:
+            return False
+        if "tags" in filters and filters["tags"]:
+            if not set(filters["tags"]).intersection(c.tags):
+                return False
+        return True
+
+    def _search_mock(self, query: str, k: int) -> list[tuple[Chunk, float]]:
+        stem = lambda w: w[:-1] if len(w) > 3 and w.endswith("s") else w
+        q = {stem(w) for w in re.findall(r"[a-z0-9]+", query.lower())} - _STOP
+        if not q:
+            return []
+        scored = []
+        for c in self.chunks:
+            words = {stem(w) for w in re.findall(r"[a-z0-9]+", (c.title + " " + c.text).lower())}
+            scored.append((c, min(1.0, len(q & words) / min(len(q), 3))))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:k]
 
     # --- staging
     def staged_files(self) -> list[dict]:
@@ -362,6 +531,7 @@ class KnowledgeBase:
             matrix = self._embed_docs(chunks)
             np.save(vdir / "embeddings.npy", matrix)
         self.chunks, self.matrix, self.version = chunks, matrix, version
+        self._build_bm25(chunks)
         store.save_settings({"active_kb": version})
 
     def _ensure_initial(self):
