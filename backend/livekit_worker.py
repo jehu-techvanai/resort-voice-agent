@@ -13,6 +13,7 @@ Pipeline: Phone → Twilio → LiveKit → Gemini Live → STT/LLM/TTS → LiveK
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 from livekit.agents import (
     Agent,
@@ -34,7 +37,6 @@ from livekit.agents import (
     function_tool,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import noise_cancellation
 from livekit import rtc, api
 
 # Add parent directory to path for imports
@@ -314,11 +316,40 @@ class VoiceAgent(Agent):
 # Twilio Media Stream Handler
 # ============================================================================
 
+# VAD / noise-gate constants for the Twilio Media Streams handler.
+# Twilio sends 20 ms of 16-bit PCM per media frame by default (320 bytes at 16 kHz).
+# These values are tunable via env so a production deploy can re-tune without code changes.
+
+_VAD_SAMPLE_RATE = 16000
+_VAD_FRAME_BYTES = 320  # 20 ms * 16 kHz * 2 bytes/frame
+_VAD_MIN_UTTERANCE_SEC = float(os.getenv("TWILIO_VAD_MIN_UTTERANCE_SEC", "0.25"))   # ignore bursts shorter than this
+_VAD_MIN_RMS = float(os.getenv("TWILIO_VAD_MIN_RMS", "0.010"))                        # silence/noise floor below this
+_VAD_SPeech_RMS = float(os.getenv("TWILIO_VAD_SPEECH_RMS", "0.025"))                  # confident-speech energy above this
+_BARGEIN_WINDOW_SEC = float(os.getenv("TWILIO_BARGEIN_WINDOW_SEC", "0.25"))           # how long caller must speak over agent before interrupt
+_BARGEIN_RMS = float(os.getenv("TWILIO_BARGEIN_RMS", "0.020"))                        # energy needed to count as barge-in
+
+
+def _audio_rms(pcm16: bytes) -> float:
+    """Return RMS of 16-bit PCM bytes, normalized to [-1, 1]."""
+    if not pcm16:
+        return 0.0
+    try:
+        arr = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768.0
+    except Exception:
+        return 0.0
+    return float(np.sqrt(np.mean(arr * arr)))
+
+
 class TwilioMediaStreamHandler:
     """
     Handle Twilio Media Streams WebSocket connections.
 
-    This receives real-time audio from Twilio and sends back audio responses.
+    Real-time bidirectional audio with:
+      - VAD / noise gate: only transcribe real speech, ignore silence and short bursts
+      - Barge-in: if the caller speaks while the agent is playing audio, interrupt
+        the agent, stop the outgoing audio, and process what the caller said
+
+    Production tuning: set TWILIO_VAD_* and TWILIO_BARGEIN_* env vars (see above).
     """
 
     def __init__(self):
@@ -326,24 +357,50 @@ class TwilioMediaStreamHandler:
         self.stt = STT()
         self.tts = TTS()
         self.llm = LLM()
+        # serialize STT transcribe calls per-call so two turns on the same call don't
+        # race the Whisper model ( WhisperModel is not thread-safe for concurrent use).
+        self._stt_locks: dict[str, asyncio.Lock] = {}
+
+    # ---------------------------------------------------------------- connection bookkeeping
+
+    def _ensure_lock(self, call_sid: str) -> asyncio.Lock:
+        if call_sid not in self._stt_locks:
+            self._stt_locks[call_sid] = asyncio.Lock()
+        return self._stt_locks[call_sid]
+
+    # ---------------------------------------------------------------- websocket entry point
 
     async def handle_websocket(self, websocket, call_sid: str):
         """Handle a Twilio Media Stream WebSocket connection."""
         log.info("Twilio Media Stream connected: call_sid=%s", call_sid)
 
-        # Store connection
         connection = {
             "websocket": websocket,
             "call_sid": call_sid,
-            "buffer": bytearray(),
-            "is_speaking": False,
-            "current_track": None,
+            "stream_sid": "",
+            "buffer": bytearray(),            # incoming caller audio, pending VAD decision
+            "speech_energy": [],              # recent frame RMS values (for barge-in)
+            "is_listening": False,            # True while we are accumulating a candidate utterance
+            "speech_start_ms": 0,             # when the current candidate utterance started
+            "total_speech_bytes": 0,          # bytes of speech seen in current candidate
+            "minimum_bytes": int(_VAD_MIN_UTTERANCE_SEC * _VAD_SAMPLE_RATE * 2),
+            "is_agent_speaking": False,       # True while we are streaming agent audio out
+            "agent_outstanding": [],          # queued-but-unsent media frames (for interrupt)
+            "agent_cancel_requested": False,  # set by barge-in; process loop drains it
+            "last_activity_ms": 0,            # last time we saw audio energy above the floor
+            "consecutive_silence_frames": 0,  # for ending an utterance
+            "ended": False,
         }
         self.connections[call_sid] = connection
 
         try:
             async for message in websocket.iter_text():
-                data = json.loads(message)
+                if connection["ended"]:
+                    break
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
 
                 event = data.get("event")
                 log.debug("Media Stream event: %s", event)
@@ -357,131 +414,315 @@ class TwilioMediaStreamHandler:
                 elif event == "dtmf":
                     await self.handle_dtmf(connection, data)
 
+                # after every event, drain any pending agent audio unless we got
+                # interrupted. This keeps the outbound stream alive while the LLM
+                # is thinking.
+                if connection["is_agent_speaking"]:
+                    await self._drain_agent_stream(connection)
+
         except Exception as e:
-            log.error("Media Stream error: %s", e)
+            log.error("Media Stream error: %s", e, exc_info=True)
         finally:
+            # tell Twilio we are done playing anything
+            await self._cancel_agent_audio(connection)
             if call_sid in self.connections:
                 del self.connections[call_sid]
+            if call_sid in self._stt_locks:
+                del self._stt_locks[call_sid]
             log.info("Media Stream disconnected: call_sid=%s", call_sid)
+
+    # ---------------------------------------------------------------- event handlers
 
     async def handle_start(self, connection: dict, data: dict):
         """Handle stream start event."""
         stream = data.get("stream", {})
         connection["call_sid"] = stream.get("callSid", connection["call_sid"])
+        connection["stream_sid"] = stream.get("streamSid", "")
 
         log.info(
             "Stream started: call_sid=%s, stream_id=%s",
             connection["call_sid"],
-            stream.get("streamSid"),
+            connection["stream_sid"],
         )
 
-        # Send initial heartbeat
+        # Send initial heartbeat so Twilio knows the connection is live
         await self.send_media(connection, {
             "event": "media",
-            "streamSid": data.get("stream", {}).get("streamSid", ""),
+            "streamSid": connection["stream_sid"],
             "media": {"payload": ""},
         })
 
     async def handle_media(self, connection: dict, data: dict):
-        """Handle incoming audio media."""
+        """Handle incoming audio media from the caller.
+
+        This is where VAD / noise gating and barge-in live:
+          1. decode the frame
+          2. if the agent is speaking, check for barge-in
+          3. feed the frame into the VAD state machine
+        """
         media = data.get("media", {})
         payload = media.get("payload", "")
-
         if not payload:
             return
 
-        # Decode base64 audio
-        import base64
-        audio_bytes = base64.b64decode(payload)
-
-        # Add to buffer
-        connection["buffer"].extend(audio_bytes)
-
-        # Check if we should process (simple threshold for demo)
-        if len(connection["buffer"]) > 16000:  # ~1 second at 16kHz
-            stream_sid = data.get("stream", {}).get("streamSid", "")
-            await self.process_audio(connection, stream_sid)
-            connection["buffer"] = bytearray()
-
-    async def process_audio(self, connection: dict, stream_sid: str = ""):
-        """Process buffered audio through STT→LLM→TTS pipeline."""
-        buffer = bytes(connection["buffer"])
-
-        if len(buffer) < 1600:
+        try:
+            audio_bytes = base64.b64decode(payload)
+        except Exception:
             return
 
-        log.debug("Processing audio: %d bytes", len(buffer))
-
-        try:
-            # Convert to float32
-            audio = pcm16_to_float(buffer)
-
-            # STT
-            from store import load_settings
-            settings = load_settings()
-            stt_engine = settings.get("stt_engine", "whisper-small")
-            transcript = self.stt.transcribe_pcm(audio, stt_engine)
-
-            if not transcript.text.strip():
-                return
-
-            log.info("Transcription: %s", transcript.text)
-
-            # LLM
-            messages = [
-                {"role": "system", "content": system_prompt(settings, [])},
-                {"role": "user", "content": transcript.text},
+        # ---- barge-in check (caller speaking while agent is playing) ----
+        if connection["is_agent_speaking"]:
+            rms = _audio_rms(audio_bytes)
+            now = time.time()
+            connection["speech_energy"].append((now, rms))
+            # keep only the recent window
+            cutoff = now - _BARGEIN_WINDOW_SEC
+            connection["speech_energy"] = [
+                (t, e) for t, e in connection["speech_energy"] if t >= cutoff
             ]
-            response_text = await self.llm.complete(messages, max_tokens=150)
+            loud_frames = sum(1 for _, e in connection["speech_energy"] if e >= _BARGEIN_RMS)
+            if loud_frames >= 2:  # at least two 20 ms frames above threshold (~40 ms)
+                log.info("Barge-in detected on call %s", connection["call_sid"])
+                connection["is_agent_speaking"] = False
+                connection["agent_cancel_requested"] = True
+                connection["speech_energy"] = []
+                # treat the current frame as the start of a new utterance
+                connection["is_listening"] = True
+                connection["speech_start_ms"] = now * 1000
+                connection["total_speech_bytes"] = 0
+                connection["consecutive_silence_frames"] = 0
+                connection["last_activity_ms"] = now * 1000
+                await self._cancel_agent_audio(connection)
+                # fall through to VAD processing of this frame below
 
-            log.info("LLM response: %s", response_text)
+        # ---- VAD / noise gate state machine ----
+        rms = _audio_rms(audio_bytes)
+        now_ms = time.time() * 1000
+        connection["last_activity_ms"] = now_ms
 
-            # TTS
-            wav_bytes = self.tts.synthesize(response_text, VOICE_ID, VOICE_SPEED)
+        # prune old energy samples
+        cutoff = now_ms - _BARGEIN_WINDOW_SEC * 1000
+        connection["speech_energy"] = [
+            (t, e) for t, e in connection["speech_energy"] if t >= cutoff
+        ]
 
-            # Send audio back to Twilio
-            import base64
-            audio_b64 = base64.b64encode(wav_bytes).decode()
+        if rms >= _VAD_MIN_RMS:
+            # there is sound here
+            connection["consecutive_silence_frames"] = 0
+            if not connection["is_listening"]:
+                # potential start of speech — wait for a minimum burst before committing
+                connection["is_listening"] = True
+                connection["speech_start_ms"] = now_ms
+                connection["total_speech_bytes"] = 0
+                connection["speech_energy"] = []
 
-            await self.send_media(connection, {
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {
-                    "payload": audio_b64,
-                },
-            })
+            connection["total_speech_bytes"] += len(audio_bytes)
+            connection["speech_energy"].append((now_ms, rms))
 
-        except Exception as e:
-            log.error("Audio processing error: %s", e)
+            # buffer the audio so we can transcribe the whole utterance at once
+            connection["buffer"].extend(audio_bytes)
+
+            # if we have enough audio and the recent energy is clearly speech, process now
+            enough = (
+                connection["total_speech_bytes"] >= connection["minimum_bytes"]
+                and _recent_energy_is_speech(connection)
+            )
+            if enough:
+                await self._flush_utterance(connection)
+        else:
+            # silence / noise floor
+            connection["consecutive_silence_frames"] += 1
+            if connection["is_listening"]:
+                # give speech a little time to resume (debounce the end)
+                if (
+                    connection["total_speech_bytes"] >= connection["minimum_bytes"]
+                    and connection["consecutive_silence_frames"] >= 6   # ~120 ms of silence
+                ):
+                    await self._flush_utterance(connection)
+                elif connection["consecutive_silence_frames"] >= 60:  # ~1.2 s silence → abandon
+                    connection["is_listening"] = False
+                    connection["total_speech_bytes"] = 0
+                    connection["buffer"] = bytearray()
+                    connection["speech_energy"] = []
 
     async def handle_stop(self, connection: dict, data: dict):
         """Handle stream stop event."""
         log.info("Stream stopped: call_sid=%s", connection["call_sid"])
-
-        # Clean up
+        connection["ended"] = True
+        connection["is_listening"] = False
         connection["buffer"] = bytearray()
+        await self._cancel_agent_audio(connection)
 
     async def handle_dtmf(self, connection: dict, data: dict):
         """Handle DTMF tones."""
         dtmf = data.get("dtmf", {})
         digit = dtmf.get("digit", "")
-
         log.info("DTMF received: %s", digit)
 
-        # Handle DTMF input
         if digit == "#":
-            # End of input, process
-            await self.process_audio(connection)
+            # end of DTMF input — flush whatever we have buffered
+            if connection["buffer"]:
+                await self._flush_utterance(connection)
         elif digit == "*":
-            # Cancel/repeat
-            pass
+            # cancel / repeat: stop agent audio and discard current candidate
+            connection["is_listening"] = False
+            connection["total_speech_bytes"] = 0
+            connection["buffer"] = bytearray()
+            connection["speech_energy"] = []
+            await self._cancel_agent_audio(connection)
+
+    # ---------------------------------------------------------------- utterance pipeline
+
+    async def _flush_utterance(self, connection: dict):
+        """Transcribe the buffered utterance, reply through LLM+TTS, then reset."""
+        connection["is_listening"] = False
+        buf = bytes(connection["buffer"])
+        connection["buffer"] = bytearray()
+        connection["total_speech_bytes"] = 0
+        connection["speech_energy"] = []
+        connection["consecutive_silence_frames"] = 0
+
+        if len(buf) < 1600:
+            return
+
+        await self.process_audio(connection, connection["stream_sid"], buf)
+
+    async def process_audio(self, connection: dict, stream_sid: str = "", audio_bytes: bytes = b""):
+        """Process audio through STT→LLM→TTS pipeline.
+
+        Called with a full utterance's worth of PCM (base64-decoded by handle_media).
+        When called from _flush_utterance, audio_bytes is the buffered utterance.
+        When called from the old path (direct), audio_bytes may be empty and we read
+        from connection["buffer"] — that path is deprecated but kept for safety.
+        """
+        if not audio_bytes:
+            audio_bytes = bytes(connection["buffer"])
+            if len(audio_bytes) < 1600:
+                return
+
+        log.debug("Processing audio: %d bytes", len(audio_bytes))
+
+        lock = self._ensure_lock(connection["call_sid"])
+        async with lock:
+            try:
+                audio = pcm16_to_float(audio_bytes)
+
+                # STT
+                from store import load_settings
+                settings = load_settings()
+                stt_engine = settings.get("stt_engine", "whisper-small")
+                transcript = self.stt.transcribe_pcm(audio, stt_engine)
+
+                text = transcript.text.strip()
+                if not text:
+                    return
+
+                log.info("Transcription: %s", text)
+
+                # LLM
+                messages = [
+                    {"role": "system", "content": system_prompt(settings, [])},
+                    {"role": "user", "content": text},
+                ]
+                response_text = await self.llm.complete(messages, max_tokens=150)
+
+                log.info("LLM response: %s", response_text)
+
+                # TTS — stream the response back in small chunks so it can be
+                # interrupted by the next barge-in.
+                if not response_text:
+                    return
+
+                wav_bytes = self.tts.synthesize(response_text, VOICE_ID, VOICE_SPEED)
+                await self._play_audio(connection, stream_sid, wav_bytes)
+
+            except Exception as e:
+                log.error("Audio processing error: %s", e, exc_info=True)
+
+    # ---------------------------------------------------------------- outbound audio (interruptible)
+
+    async def _play_audio(self, connection: dict, stream_sid: str, wav_bytes: bytes):
+        """Convert a WAV to 16-bit PCM frames and stream them to Twilio in small
+        chunks. While sending, if barge-in arrives we stop early."""
+        if not wav_bytes:
+            return
+
+        from io import BytesIO
+        import wave
+
+        try:
+            with BytesIO(wav_bytes) as f:
+                with wave.open(f, "rb") as wav_file:
+                    sample_rate = wav_file.getframerate()
+                    frames = wav_file.readframes(wav_file.getnframes())
+        except Exception as e:
+            log.error("Failed to decode TTS WAV: %s", e)
+            return
+
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+        # send in 100 ms chunks so a barge-in can cut the reply short
+        chunk_ms = 100
+        samples_per_chunk = int(sample_rate * chunk_ms / 1000)
+        connection["is_agent_speaking"] = True
+        connection["agent_cancel_requested"] = False
+
+        try:
+            for i in range(0, len(audio), samples_per_chunk):
+                if connection["agent_cancel_requested"]:
+                    log.debug("Agent audio interrupted by barge-in")
+                    break
+
+                chunk = audio[i : i + samples_per_chunk]
+                if len(chunk) < samples_per_chunk / 2:
+                    break
+
+                pcm = (chunk * 32767).astype("<i2").tobytes()
+                b64 = base64.b64encode(pcm).decode()
+
+                await self.send_media(connection, {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": b64},
+                })
+        except Exception as e:
+            log.error("Error streaming agent audio: %s", e)
+        finally:
+            connection["is_agent_speaking"] = False
+            connection["agent_cancel_requested"] = False
+
+    async def _drain_agent_stream(self, connection: dict):
+        """No-op placeholder: agent audio is now streamed directly in _play_audio.
+        Kept so the main loop's call site stays meaningful if we later add a queue."""
+        pass
+
+    async def _cancel_agent_audio(self, connection: dict):
+        """Stop any in-progress agent audio and clear the speaking flag."""
+        connection["is_agent_speaking"] = False
+        connection["agent_cancel_requested"] = True
+
+    # ---------------------------------------------------------------- helpers
 
     async def send_media(self, connection: dict, data: dict):
-        """Send media response to Twilio."""
+        """Send a media frame to Twilio."""
         try:
             await connection["websocket"].send_json(data)
         except Exception as e:
             log.error("Failed to send media: %s", e)
+
+
+def _recent_energy_is_speech(connection: dict) -> bool:
+    """Return True if the recent frames look like speech rather than noise/silence."""
+    samples = connection.get("speech_energy", [])
+    if not samples:
+        return False
+    recent = samples[-6:]  # last ~120 ms
+    if not recent:
+        return False
+    avg = sum(e for _, e in recent) / len(recent)
+    # need a clear margin above the noise floor
+    return avg >= _VAD_SPeech_RMS and avg > _VAD_MIN_RMS * 1.5
+
 
 
 # ============================================================================

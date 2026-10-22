@@ -41,3 +41,10 @@ Thumbs.db
 
 # Data dir (runtime data, may contain logs/passwords)
 data/
+
+# TWILIO_VAD_MIN_UTTERANCE_SEC=0.25   # min speech length to count as an utterance
+# TWILIO_VAD_MIN_RMS=0.010             # silence/noise floor
+# TWILIO_VAD_SPEECH_RMS=0.025          # confident-speech energy
+# TWILIO_BARGEIN_WINDOW_SEC=0.25       # how long caller speaks over agent before interrupt
+# TWILIO_BARGEIN_RMS=0.020             # energy needed to count as barge-in
+
