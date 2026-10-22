@@ -92,6 +92,13 @@ export default function Talk({ health }) {
     return () => clearInterval(id)
   }, [running, refreshPhase])
 
+  // heartbeat so the backend's idle timeout knows this live session is not a dead link
+  useEffect(() => {
+    if (!running) return
+    const id = setInterval(() => send({ type: 'ping' }), 30000)
+    return () => clearInterval(id)
+  }, [running])
+
   const addLog = (entry) => setLog((l) => [...l.slice(-80), entry])
   const updateTurn = (turn, fn) => setLog((l) => l.map((e) => (e.kind === 'agent' && e.turn === turn ? fn({ ...e }) : e)))
 

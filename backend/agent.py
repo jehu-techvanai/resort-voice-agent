@@ -218,9 +218,22 @@ def system_prompt_v2(settings: dict, context: list, user_text: str, greeted: boo
         "remember the structured details so the backend can record them. Do not say the word "
         "'capability' out loud."
     )
+    if prev_answer:
+        brief = prev_answer[:250] + ("..." if len(prev_answer) > 250 else "")
+    else:
+        brief = ""
     extra.append(
-        "If you do not know the answer from INFO, say exactly UNKNOWN. Do not invent prices, "
-        "dates, availability, or policies. For numbers you cite, prefer ones visible in INFO."
+        "Repetition guard: "
+        + ("your last spoken reply was: \"" + brief + "\". " if brief else "")
+        + "Compose each reply fresh. Never reuse whole sentences or whole phrases from your "
+        "earlier replies — the customer notices a parrot immediately. Answer the newest "
+        "message in new words."
+    )
+    extra.append(
+        "Identity: questions like 'who are you' or 'what is your name' are normal and "
+        "answerable — reply briefly with your name and role. Scope: if the question is not "
+        "something a receptionist at this business could answer, reply with exactly UNKNOWN "
+        "rather than guessing."
     )
     extra.append(
         "NEVER repeat your name or the business name in every reply. Only introduce yourself on "

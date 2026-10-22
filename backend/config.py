@@ -82,6 +82,12 @@ SARVAM_API_KEY = _env("SARVAM_API_KEY", "")
 SARVAM_MODEL = _env("SARVAM_MODEL", "saaras:v4")
 SARVAM_LANGUAGE = _env("SARVAM_LANGUAGE", "unknown")   # unknown = detect (needed for the English check); or en-IN
 
+# ---- production hardening: websocket + upload limits
+WS_MAX_SESSIONS = int(_env("WS_MAX_SESSIONS", "8"))            # concurrent live sessions before rejecting
+WS_IDLE_TIMEOUT_SEC = int(_env("WS_IDLE_TIMEOUT_SEC", "600"))   # close sessions that send nothing for this long
+WS_MAX_MSG_BYTES = int(_env("WS_MAX_MSG_BYTES", str(4 * 1024 * 1024)))   # drop frames bigger than this
+MAX_UPLOAD_BYTES = int(_env("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))  # per-file knowledge upload cap
+
 # ---- v2: session memory (Redis) + persistence (SQLite) + hybrid RAG
 REDIS_URL = _env("REDIS_URL", "")
 SQLITE_DB = Path(_env("SQLITE_DB", str(DATA_DIR / "v2.db")))

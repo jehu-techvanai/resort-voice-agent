@@ -16,6 +16,7 @@ import csv
 import io
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -52,7 +53,7 @@ async def lifespan(app: FastAPI):
     await ENGINES["llm"].warmup()
     engine = store.load_settings()["stt_engine"]
     await asyncio.get_running_loop().run_in_executor(None, ENGINES["stt"].preload, engine)
-    asyncio.create_task(_keep_llm_loaded())
+    keepalive_task = asyncio.create_task(_keep_llm_loaded())
     kb = ENGINES["kb"]
     _log.info("models ready in %.1fs, knowledge base %s with %d chunks",
               time.perf_counter() - t0, kb.version, len(kb.chunks))
@@ -68,6 +69,7 @@ async def lifespan(app: FastAPI):
     _log.info("v2 db ok=%s", db_ok)
     yield
     # teardown
+    keepalive_task.cancel()
     await redis_store.close()
     await vet_db.close()
 
@@ -135,6 +137,9 @@ async def public_settings():
 
 # ---------------------------------------------------------------- live session
 
+_active_ws: set[WebSocket] = set()
+
+
 @app.websocket("/ws")
 async def ws_session(ws: WebSocket, mode: str = Query("web"), key: str = Query("")):
     await ws.accept()
@@ -145,6 +150,11 @@ async def ws_session(ws: WebSocket, mode: str = Query("web"), key: str = Query("
         await ws.send_json({"type": "error", "message": "invalid API key"})
         await ws.close(code=4401)
         return
+    if len(_active_ws) >= config.WS_MAX_SESSIONS:
+        await ws.send_json({"type": "error", "message": "too many concurrent sessions"})
+        await ws.close(code=4429)
+        return
+    _active_ws.add(ws)
 
     async def send(obj):
         await ws.send_text(json.dumps(obj))
@@ -157,15 +167,33 @@ async def ws_session(ws: WebSocket, mode: str = Query("web"), key: str = Query("
     tasks: set[asyncio.Task] = set()
 
     def spawn(coro):
-        t = asyncio.create_task(coro)
+        # background handlers must never die silently: log anything that crashes them
+        async def _guard():
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.exception("websocket handler crashed (mode=%s)", mode)
+        t = asyncio.create_task(_guard())
         tasks.add(t)
         t.add_done_callback(tasks.discard)
 
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                # a connection that sends nothing for WS_IDLE_TIMEOUT_SEC is dead (callers
+                # are kept alive by the browser heartbeat) and must not hold GPU models forever
+                msg = await asyncio.wait_for(ws.receive(), timeout=config.WS_IDLE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                _log.info("websocket idle timeout, closing (mode=%s)", mode)
+                break
             if msg["type"] == "websocket.disconnect":
                 break
+            payload = msg.get("bytes") or msg.get("text") or ""
+            if len(payload) > config.WS_MAX_MSG_BYTES:
+                _log.warning("websocket frame too large (%d bytes), dropping", len(payload))
+                continue
             if msg.get("bytes") is not None:
                 spawn(session.on_audio(msg["bytes"]))
                 continue
@@ -195,6 +223,7 @@ async def ws_session(ws: WebSocket, mode: str = Query("web"), key: str = Query("
     except WebSocketDisconnect:
         pass
     finally:
+        _active_ws.discard(ws)
         await session.cancel_current()
         for t in list(tasks):
             t.cancel()
@@ -272,8 +301,12 @@ async def kb_status():
 async def kb_upload(files: list[UploadFile] = File(...)):
     kb, out, errors = ENGINES["kb"], [], []
     for f in files:
+        content = await f.read()
+        if len(content) > config.MAX_UPLOAD_BYTES:
+            errors.append(f"{f.filename}: file too large (max {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+            continue
         try:
-            out.append(kb.stage(f.filename or "upload", await f.read()))
+            out.append(kb.stage(f.filename or "upload", content))
         except ParseError as e:
             errors.append(str(e))
     return {"staged": kb.staged_files(), "added": out, "errors": errors}
@@ -432,7 +465,7 @@ async def conversation_note(conversation_id: str, body: dict):
 
 
 @app.get("/api/admin/conversations/{conversation_id}/export", dependencies=[Depends(require_admin)])
-async def conversation_export(conversation_id: str, format: str = Query("json", regex="^(json|csv)$")):
+async def conversation_export(conversation_id: str, format: str = Query("json", pattern="^(json|csv)$")):
     if not vet_db.conn:
         raise HTTPException(503, "sqlite not enabled")
     conv = await vet_db.get_conversation(conversation_id)
@@ -474,11 +507,24 @@ async def unanswered_list_update(entry_id: str, resolved: bool = Query(True)):
 
 # ---------------------------------------------------------------- transcript / agent log files
 
+# only real transcript / agent log file names: no traversal, no dotfiles, no anything else
+_LOGFILE_RE = re.compile(r"^(transcript|agent_log)-[A-Za-z0-9._-]{1,80}\.txt$")
+
+
+def _safe_log_file(filename: str):
+    from store import DATA_DIR
+    if not _LOGFILE_RE.fullmatch(filename or ""):
+        raise HTTPException(400, "invalid file name")
+    path = DATA_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, f"File not found: {filename}")
+    return path
+
+
 @app.get("/api/admin/log-files", dependencies=[Depends(require_admin)])
 async def log_files():
     """List available transcript and agent log files in DATA_DIR."""
     from store import DATA_DIR
-    import re
     files = []
     if not DATA_DIR.exists():
         return {"ok": True, "files": []}
@@ -494,20 +540,14 @@ async def log_files():
 @app.get("/api/admin/log-files/{filename}/content", dependencies=[Depends(require_admin)])
 async def log_file_content(filename: str):
     """Return the raw content of a transcript or agent log file."""
-    from store import DATA_DIR
-    path = DATA_DIR / filename
-    if not path.exists() or not path.is_file():
-        raise HTTPException(404, f"File not found: {filename}")
+    path = _safe_log_file(filename)
     return {"ok": True, "filename": filename, "content": path.read_text(encoding="utf-8")}
 
 
 @app.get("/api/admin/log-files/{filename}/download", dependencies=[Depends(require_admin)])
 async def log_file_download(filename: str):
     """Download a transcript or agent log file."""
-    from store import DATA_DIR
-    path = DATA_DIR / filename
-    if not path.exists() or not path.is_file():
-        raise HTTPException(404, f"File not found: {filename}")
+    path = _safe_log_file(filename)
     return PlainTextResponse(path.read_text(encoding="utf-8"),
                             media_type="text/plain",
                             headers={"Content-Disposition": f"attachment; filename={filename}"})

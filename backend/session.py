@@ -13,6 +13,7 @@ import asyncio
 import base64
 import difflib
 import json
+import logging
 import re
 import time
 import uuid
@@ -28,6 +29,8 @@ from agent import Guardrails, extract_contact, extract_booking_intent, system_pr
 
 ENGINES = {}   # filled by app.py at startup: stt, tts, llm, kb, redis_session, db
 
+_log = logging.getLogger("session")
+
 ENGLISH_ONLY_REPLY = "Sorry, I can only help in English at the moment. Could you please say that again in English?"
 NOT_HEARD_REPLY = "Sorry, I didn't catch that. Could you say it again?"
 
@@ -35,6 +38,7 @@ NOT_HEARD_REPLY = "Sorry, I didn't catch that. Could you say it again?"
 HALLUCINATIONS = {
     "thank you", "thanks", "thank you very much", "thanks for watching", "thank you for watching", "you", "bye",
     "okay", "ok", "so", "oh", "uh", "um", "hmm", "mm", "yeah", "the", "i", "please subscribe", "subtitles by",
+    "praise",
 }
 WAKE_PREFIXES = {"hey", "hi", "hello", "ok", "okay", "oh", "excuse", "me", "so"}
 SMALLTALK = re.compile(r"^(hi|hello|hey|good (morning|afternoon|evening)|thanks?|thank you|ok(ay)?|yes|no|yeah|"
@@ -45,6 +49,53 @@ SMALLTALK = re.compile(r"^(hi|hello|hey|good (morning|afternoon|evening)|thanks?
 GREETINGS = re.compile(r"^(hi|hello|hey|good (morning|afternoon|evening|day)|yo|what'?s up|howdy|welcome|bye|goodbye)\b", re.I)
 DECLINE = re.compile(r"\b(no( thanks?| thank you)?|not now|don'?t|do not|never ?mind|skip|no need)\b", re.I)
 QUESTION_START = re.compile(r"^(?:and |also |so |but |okay,? |ok,? |well,? |right,? )?\s*(what|how|is|are|do|does|can|could|where|when|which|who|why|will|would|tell)\b", re.I)
+
+# Words and short phrases that signal the speaker is still talking about the resort.
+# Used to let context-carrying follow-ups wake the agent even without a question word.
+RESORT_FOLLOWUP_HINTS = re.compile(
+    r"\b(room|rooms|villa|villas|suite|suites|garden|sea|pool|beach|view|deluxe|famil"
+    r"y|price|prices|cost|costs|cheap|expensive|rupees|rs\.?|budget|rate|rates|spend"
+    r"|stay|staying|book|booking|reserve|reservation|availab|available|availability"
+    r"|check.?in|check.?out|deposit|cancel|cancellation|transfer|airport|spa|ayurv"
+    r"eda|doctor|massage|dinner|lunch|breakfast|restaurant|bar|pool|gym|yoga|kit"
+    r"chen|club|kids|family|couple|single|adult|child|guest|guests|person|people"
+    r"|wedding|event|wedding|party|group|weather|location|where|distance|km|hour"
+    r"|minute|hour|time|opening|open|close|closed|phone|email|website|website"
+    r"|wifi|wi.?fi|parking|accessible|wheelchair|pet|pets|smoking|non.?smoking"
+    r"|per night|per person|for two|for one|for three|for four|for a|for an"
+    r"|low season|peak season|december|january|summer|winter|monsoon|rain"
+    r"|which one|what's included|what is included|what about|how about|and the"
+    r"|tell me|explain|describe|more|detail|details|include|includes|extra"
+    r"|additional|nearby|surrounding|area|nearby|close to|far| kilometres\b)"
+    r"|\b(sea view|pool villa|garden view|family suite|deluxe room|beach front"
+    r"|lighthouse beach|kovalam|trivandrum|kovalam|kerala|kerala|india|kovalon"
+    r"|palmlagoon|palm lagoon)\b",
+    re.I,
+)
+
+
+def _context_carries_resort_topic(text: str) -> bool:
+    """Return True when *text* is short but clearly continues a resort conversation.
+
+    Catches follow-ups like 'And the deluxe rooms?', 'What about peak season?',
+    'How much for a pool villa?', 'Tell me about the family suite' that do not start
+    with a question word but still carry enough resort context to deserve a reply.
+    """
+    t = _norm(text)
+    if len(t) < 4:
+        return False
+    # must carry at least one resort topic hint
+    if not RESORT_FOLLOWUP_HINTS.search(text):
+        return False
+    # reject pure interjections / back-channel that happen to contain a keyword
+    # e.g. 'oh', 'ok', 'yeah', 'right', 'cool' with a stray 'room' from echo
+    pure_backchannel = bool(
+        re.match(r"^(oh|ok|okay|yeah|yep|yes|no|right|cool|nice|great|good|thanks?|thank you|please|sure|alright)\b",
+                  text.strip(), re.I)
+    )
+    if pure_backchannel and len(text.strip().split()) <= 3:
+        return False
+    return True
 NUM_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
              "six": "6", "seven": "7", "eight": "8", "nine": "9"}
 
@@ -94,6 +145,11 @@ def match_wake(text: str, name: str) -> tuple[bool, str]:
         return True, text
     # Also accept direct questions as a valid wake-up — the caller may just want an answer.
     if QUESTION_START.match(text.strip()):
+        return True, text
+    # Accept context-carrying follow-ups that don't start with a question word.
+    # Examples: "And the deluxe rooms?", "What about peak season?", "How about the pool villa?",
+    # "Tell me about the family suite." These carry enough resort context to deserve a reply.
+    if _context_carries_resort_topic(text.strip()):
         return True, text
     return False, text
 
@@ -153,45 +209,46 @@ def system_prompt(settings: dict, context: list, greeted: bool = False,
         "Say something warm and welcoming."
         if not greeted
         else
-        "You have already greeted the caller earlier in this conversation. "
-        "Do NOT re-introduce yourself or say the business name again. "
-        "Answer directly and naturally without repeating who you are."
+        "You greeted the customer earlier in this conversation. Do NOT re-introduce yourself "
+        "or repeat the business name; answer directly and naturally."
     )
-    repeat_rule = (
-        "*** IMPORTANT: You have already answered the following in this conversation. "
-        "If the customer's new message is a follow-up, thank-you, or vague reference to what you "
-        "already said, do NOT repeat the full answer. Just acknowledge briefly. ***\n"
-        "You already said: " + prev_answer + "\n"
-        "If the customer asks something you already answered in this conversation, "
-        "do NOT repeat the full answer word for word. Instead, briefly confirm what you said "
-        "or add a small new detail. For example, if you already said the resort is in Kerala, "
-        "and they ask again, say something like 'As I mentioned, it's in Kerala, on Lighthouse Beach in Kovalam.' "
-        "Never copy-paste your previous reply."
-        if prev_answer
-        else
-        "If the customer asks something you already answered, do NOT repeat the full answer. "
-        "Briefly confirm and add a small new detail instead."
-    )
-    return f"""You are {settings['agent_name']}, the receptionist at {settings['business_name']}, a {settings.get('business_type') or 'business'}. You are speaking to a customer, so your words will be read aloud.
+    repeat_rule = ""
+    if prev_answer:
+        brief = prev_answer[:200] + ("..." if len(prev_answer) > 200 else "")
+        repeat_rule = (
+            "Use the conversation history above instead of repeating yourself. If the customer's "
+            "message refers back to what you already said (your last reply began: " + brief + "), "
+            "confirm briefly or add one new detail, and never copy the whole answer word for word."
+        )
+    return f"""You are {settings['agent_name']}, the receptionist at {settings['business_name']}, a {settings.get('business_type') or 'business'}. You are speaking to a customer on the phone and your words will be read aloud.
+
+How to talk:
+- Sound like a warm, real human receptionist: short natural sentences, one idea each. Ask one short follow-up question when it keeps the conversation moving.
+- Converse with what the customer actually asked. If they ask about price ranges, talk about the price ranges they mean, not a generic line about rooms being available.
+- Vary how your replies open and flow; never start two replies in a row in the same way, and never reuse a sentence you already said in this conversation.
+- For thanks or a short acknowledgement, give one very brief friendly line in your own words, and do not restart what you were explaining. Say goodbye naturally when the customer is ending the call, in your own warm words.
+- If asked who you are or what your name is, answer briefly with your name and that you are the receptionist here — this is never UNKNOWN.
+- You remember the conversation so far: build on it naturally, the way a receptionist would, instead of treating each message as the first one.
 
 Rules:
 - Speak English only. If the customer uses another language, politely ask them to speak in English.
 - Answer only from INFO below. If INFO does not contain the answer, reply with exactly the single word UNKNOWN and nothing else. Never guess or invent prices, dates, policies or availability.
-- For greetings, thanks or small talk, reply briefly and naturally without using UNKNOWN.
 - Keep each reply to one to three short sentences. No lists, no markdown, no emojis, no symbols like the rupee sign; say "rupees".
 - You cannot confirm bookings or check live availability. If the customer wants to book, ask for their name, dates and number of guests, and say the team will confirm.
-- Be warm and natural. Ask one short follow-up question when it helps.
 - {intro_rule}
-- {repeat_rule}
+{('- ' + repeat_rule) if repeat_rule else ''}
 {('- ' + extra) if extra else ''}
 INFO:
 {facts}"""
 
 
 def contact_prompt() -> str:
-    return ("Extract the person's name and phone number from the message. Reply with JSON only, like "
-            '{"name": "Ravi", "phone": "9847012345"}. Use empty strings for anything not given. '
-            "Write the phone as digits only.")
+    return ("From the customer's message, extract their name and phone number (phone as digits "
+            "only). Also decide move_on: true when the customer is clearly not giving contact "
+            "details now — for example they declined, changed the subject, or asked a new "
+            'question. Reply with JSON only, like '
+            '{"name": "Ravi", "phone": "9847012345", "move_on": false}. '
+            "Use empty strings for anything not given.")
 
 
 class Session:
@@ -213,6 +270,8 @@ class Session:
         self.heard_upto: dict[int, int] = {}
         self.recent_agent_text: list[str] = []
         self.decide_lock = asyncio.Lock()
+        # consecutive unknown turns; contact capture only arms from the second one on
+        self._unknown_streak = 0
         # Last assistant reply, so the system prompt can tell the LLM not to repeat it.
         self._last_answer: str = ""
         # Per-conversation transcript and agent log file paths.
@@ -288,7 +347,12 @@ class Session:
         elif tr.no_speech_prob > config.NO_SPEECH_PROB and tr.avg_logprob < -0.8:
             reason = "no speech"
         elif _norm(text) in HALLUCINATIONS and dur < 2.5 and not self.pending_contact:
-            reason = "noise"
+            # Short backchannels ("thank you", "okay") can be genuine while a conversation
+            # is open. Only drop them outright while the agent is busy speaking; otherwise
+            # let the dynamic wake check judge them with the conversation context, instead
+            # of a hardcoded word list.
+            if self.speaking_turn is not None:
+                reason = "noise"
         elif self.is_echo(text):
             reason = "echo of agent"
         if reason:
@@ -296,25 +360,26 @@ class Session:
 
         async with self.decide_lock:
                 woke_now = False
+                kind = "other"
                 if self.wake and not self.awake():
-                    # Dynamic wake decision: ask the LLM whether this is a genuine utterance.
-                    # Falls back to match_wake (calling name / greetings / questions) if LLM is busy.
-                    ok, rest, dynamic = await self._dynamic_wake_check(text)
+                    # The LLM decides first, using the session history — this is what lets a
+                    # garbled or name-less follow-up wake the agent. The name/greeting matcher
+                    # is only an emergency fallback inside _dynamic_wake_check.
+                    ok, text, dynamic, kind = await self._dynamic_wake_check(text)
                     if not ok:
                         return await self.send({"type": "ignored", "utt": utt, "reason": "no calling name", "text": text})
-                    text, woke_now = rest, True
+                    woke_now = True
                     if dynamic:
-                        _log = __import__("logging").getLogger("session")
-                        _log.debug("dynamic wake accepted: %r", text)
+                        _log.debug("dynamic wake accepted (kind=%s): %r", kind, text)
                 elif self.wake:
+                    # Inside the follow-up window: keep the conversation flowing, accept what
+                    # got past the noise filters and strip a calling name if one was said.
+                    # Whether it is a greeting/goodbye/thanks is routed in run_turn.
                     ok, rest = match_wake(text, self.settings["agent_name"])
                     if ok and rest:
                         text = rest
                 non_english = tr.language != "en" and tr.language_prob >= config.NON_ENGLISH_THRESHOLD
-                # A pure greeting (no calling name removed, just a greeting word) gets the formal greeting.
-                is_pure_greeting = woke_now and SMALLTALK.match(text.strip()) and len(text.strip().split()) <= 2
-                await self.start_turn(text, utt=utt, t0=t0, stt_ms=stt_ms, non_english=non_english,
-                                      greet_only=is_pure_greeting)
+                await self.start_turn(text, utt=utt, t0=t0, stt_ms=stt_ms, non_english=non_english, kind=kind)
 
     async def on_text(self, text: str):
         self.utt_no += 1
@@ -392,48 +457,167 @@ class Session:
             _log = __import__("logging").getLogger("session")
             _log.debug("v2 session sync skipped: %s", e)
 
-    async def _dynamic_wake_check(self, text: str) -> tuple[bool, str, bool]:
-        """Ask the LLM whether *text* is a genuine customer utterance worth waking for.
+    def _recent_exchange(self, limit: int = 6) -> str:
+        """Render the last few conversation turns so LLM decisions can use the session history."""
+        s = self.settings
+        lines = []
+        for m in self.history[-limit:]:
+            who = "Customer" if m["role"] == "user" else "You"
+            lines.append(f"{who}: {m['content']}")
+        return "\n".join(lines)
 
-        Returns (ok, rest, dynamic):
-        - ok=True means wake the session; rest is text with calling name stripped if found.
-        - dynamic=True means the LLM made the decision (not a hardcoded regex).
+    async def _dynamic_wake_check(self, text: str) -> tuple[bool, str, bool, str]:
+        """Decide dynamically (LLM, using the session history) whether *text* deserves a reply.
 
-        Falls back to match_wake if the LLM is not available or times out.
+        Returns (ok, rest, dynamic, kind):
+        - ok=True means wake the session; rest is the text to continue with. When the transcript
+          has an obvious speech-to-text slip (e.g. 'praise ranges' garbled during a discussion
+          about prices), rest is a lightly corrected wording so retrieval and the answer track
+          what the customer actually meant.
+        - kind labels the utterance ('greeting' | 'goodbye' | 'thanks' | 'question' | 'other')
+          so the turn can be routed without keyword lists.
+        - dynamic=True means the LLM made the decision.
+
+        The name/greeting matcher below the LLM is only an emergency fallback for when the
+        LLM is unreachable — the LLM decides in normal operation.
         """
-        # First try the fast hardcoded path (calling name, greetings, questions).
-        ok, rest = match_wake(text, self.settings["agent_name"])
-        if ok:
-            return ok, rest, False
-
-        # Dynamic path: ask the LLM.
+        llm = ENGINES.get("llm")
+        if not llm:
+            return self._wake_fallback(text)
+        s = self.settings
+        convo = self._recent_exchange()
+        prompt = (
+            f"You are {s['agent_name']}, the receptionist at {s['business_name']}, a "
+            f"{s.get('business_type') or 'business'}. Speech-to-text produced this transcript "
+            f"of what the customer said:\n\"" + text + "\"\n"
+        )
+        if convo:
+            prompt += "\nRecent part of your conversation with this customer:\n" + convo + "\n"
+        else:
+            prompt += ("\nThere is no recent conversation with this customer yet, so be strict: "
+                       "only accept it if it clearly names you or the business, or is a full "
+                       "question a receptionist would answer.\n")
+        prompt += (
+            "\nDecide:\n"
+            "- wake: whether the customer would expect a reply. true for a real question, "
+            "request, greeting, correction, thanks or acknowledgement, or a short follow-up "
+            "to what you were just discussing — even when the transcript came out garbled or "
+            "the customer forgot to say your name. false for background noise, another "
+            "conversation, phantom transcriptions or meaningless words.\n"
+            "- kind: the closest label — \"greeting\" (hello or who-are-you opener), "
+            "\"goodbye\" (ending the conversation), \"thanks\" (thank you or a short "
+            "acknowledgement), \"question\" (asking anything), \"other\".\n"
+            "- clean: if wake=true and the transcript contains an obvious transcription slip, "
+            "a corrected wording; otherwise the transcript unchanged.\n"
+            'Reply with JSON only, like {"wake": true, "kind": "question", '
+            '"clean": "price ranges"} or {"wake": false, "kind": "", "clean": ""}.'
+        )
         try:
-            llm = ENGINES.get("llm")
-            if not llm:
-                return ok, rest, False
-            s = self.settings
-            prompt = (
-                f"You are {s['agent_name']}, a receptionist at {s['business_name']}. "
-                f"A customer just said this while the agent was asleep: \"" + text + "\"\n"
-                "Is this a genuine customer utterance that deserves a reply? "
-                "YES for: any real question, request, greeting, statement, follow-up question, "
-                "or anything a human would actually say to a receptionist. "
-                "Also YES for follow-ups like 'who are you?', 'what was that?', or corrections. "
-                "NOT noise, echo, random sounds, or a few meaningless words like 'um', 'ah'.\n"
-                "Reply with exactly ONE word: YES or NO. Nothing else.\n"
-            )
             resp = await asyncio.wait_for(
-                llm.complete([{"role": "user", "content": prompt}], max_tokens=4),
+                llm.complete([{"role": "user", "content": prompt}], max_tokens=28),
+                timeout=4.0,
+            )
+            m = re.search(r"\{.*\}", resp, re.S)
+            if not m:
+                return self._wake_fallback(text)
+            data = json.loads(m.group(0))
+            clean = str(data.get("clean") or "").strip() or text
+            kind = str(data.get("kind") or "").strip().lower()
+            if kind not in ("greeting", "goodbye", "thanks", "question", "other"):
+                kind = "other"
+            return bool(data.get("wake")), clean, True, kind
+        except Exception as e:
+            _log.debug("wake check fell back to the name/greeting matcher: %s", e)
+            return self._wake_fallback(text)
+
+    def _wake_fallback(self, text: str) -> tuple[bool, str, bool, str]:
+        """Emergency wake decision when the LLM is unavailable (production safety)."""
+        ok, rest = match_wake(text, self.settings["agent_name"])
+        return ok, rest, False, "other"
+
+    async def _route_short(self, text: str) -> str:
+        """Classify a short message with the LLM (plus conversation context) so routing
+        into goodbye / formal greeting / brief-thanks never relies on keyword lists."""
+        llm = ENGINES.get("llm")
+        if not llm:
+            return self._route_fallback(text)
+        s = self.settings
+        convo = self._recent_exchange()
+        prompt = (
+            f"You are {s['agent_name']}, the receptionist at {s['business_name']}. "
+            f"The customer says: \"" + text + "\"\n"
+        )
+        if convo:
+            prompt += "\nRecent part of your conversation with this customer:\n" + convo + "\n"
+        prompt += (
+            "\nChoose the kind of this message:\n"
+            "- greeting: a hello or 'who are you' style opener\n"
+            "- goodbye: they are ending the conversation\n"
+            "- thanks: thanking you or a short acknowledgement\n"
+            "- other: anything else (questions, requests, business matters)\n"
+            'Reply with JSON only, like {"kind": "other"}.'
+        )
+        try:
+            resp = await asyncio.wait_for(
+                llm.complete([{"role": "user", "content": prompt}], max_tokens=16),
                 timeout=3.0,
             )
-            decision = resp.strip().upper()
-            if decision.startswith("YES") or decision == "Y":
-                return True, text, True
-            return False, text, True
-        except Exception:
-            return ok, rest, False
+            m = re.search(r"\{.*\}", resp, re.S)
+            if m:
+                data = json.loads(m.group(0))
+                kind = str(data.get("kind") or "").strip().lower()
+                if kind in ("greeting", "goodbye", "thanks"):
+                    return kind
+            return "other"
+        except Exception as e:
+            _log.debug("short-message router fell back to the matcher: %s", e)
+            return self._route_fallback(text)
 
+    def _route_fallback(self, text: str) -> str:
+        """Emergency routing when the LLM is unavailable (production safety)."""
+        t = text.strip().lower()
+        if t in ("bye", "goodbye", "bye bye", "good bye"):
+            return "goodbye"
+        if SMALLTALK.match(text.strip()) and len(text.split()) <= 3:
+            return "greeting"
+        if SMALLTALK.match(text.strip()):
+            return "thanks"
+        return "other"
 
+    async def _standalone_query(self, text: str) -> str:
+        """Rewrite a short follow-up into a self-contained retrieval query using the
+        conversation history: "how much is it?" becomes e.g. "price for the sea view
+        deluxe room". Returns the original text when there is nothing to resolve."""
+        llm = ENGINES.get("llm")
+        convo = self._recent_exchange()
+        s = self.settings
+        if not llm or not convo:
+            return text
+        prompt = (
+            f"You are the receptionist at {s['business_name']}. Below is the recent part "
+            f"of your conversation with this customer, followed by their latest message.\n"
+            + convo + "\n\n"
+            "Latest message: \"" + text + "\"\n\n"
+            "Rewrite the latest message as one short self-contained search query that can be "
+            "looked up in the knowledge base on its own: replace words like 'it', 'that one', "
+            "'also', 'what about', 'tell me more' with the actual topic names they refer to in "
+            "the conversation. If the latest message is already self-contained, return it "
+            "unchanged. Reply with the query text only — no quotes and no explanation."
+        )
+        try:
+            resp = await asyncio.wait_for(
+                llm.complete([{"role": "user", "content": prompt}], max_tokens=50),
+                timeout=3.0,
+            )
+            out = resp.strip().strip('"').strip()
+            out = out.rstrip(".").strip()
+            # Ignore nonsense or overly long outputs; the raw message is the fallback.
+            if 2 < len(out) <= 160 and not out.startswith(("http", "{")):
+                return out
+            return text
+        except Exception as e:
+            _log.debug("standalone query rewrite skipped: %s", e)
+            return text
 
     def _state_dict(self) -> dict:
         return {
@@ -463,7 +647,7 @@ class Session:
             if len(heard) < len(full):
                 self.history[-1]["content"] = (" ".join(heard) + " ...") if heard else "(interrupted)"
 
-    async def start_turn(self, text: str, utt: int, t0: float, stt_ms: int, non_english=False, greet_only=False):
+    async def start_turn(self, text: str, utt: int, t0: float, stt_ms: int, non_english=False, kind="other"):
         await self.cancel_current()
         self.turn_no += 1
         turn = self.turn_no
@@ -481,7 +665,7 @@ class Session:
             except Exception as e:
                 _log = __import__("logging").getLogger("session")
                 _log.debug("v2 start_conversation skipped: %s", e)
-        self.task = asyncio.create_task(self.run_turn(turn, text, t0, stt_ms, non_english, greet_only))
+        self.task = asyncio.create_task(self.run_turn(turn, text, t0, stt_ms, non_english, kind))
 
     async def speak(self, turn: int, sentences: list[str], t0: float, timings: dict):
         """Send fixed sentences (no LLM)."""
@@ -498,13 +682,19 @@ class Session:
             await self.send({"type": "audio", "turn": turn, "index": i, "wav_b64": base64.b64encode(wav).decode()})
         self.recent_agent_text += sentences
 
-    async def run_turn(self, turn, user_text, t0, stt_ms, non_english, greet_only):
+    async def run_turn(self, turn, user_text, t0, stt_ms, non_english, kind="other"):
         s = self.settings
         timings = {"stt_ms": stt_ms}
         sources, unknown = [], False
         try:
-            # End-of-session greeting: use the configured goodbye text from settings.
-            if SMALLTALK.match(user_text.strip()) and user_text.strip().lower() in ("bye", "goodbye"):
+            # Short messages are routed by the LLM with the conversation context (greeting /
+            # goodbye / thanks get their own handling instead of keyword matching). Longer
+            # texts cannot be a hello or a farewell, so they skip the router entirely.
+            if kind not in ("greeting", "goodbye", "thanks") and len(user_text.split()) <= 5:
+                kind = await self._route_short(user_text)
+
+            # End-of-session goodbye: the configured goodbye text, chosen by the router.
+            if kind == "goodbye":
                 goodbye = s.get("goodbye_text", "Goodbye! Have a nice day.")
                 await self.speak(turn, [goodbye], t0, timings)
                 self.history += [{"role": "user", "content": user_text}, {"role": "assistant", "content": goodbye}]
@@ -512,15 +702,12 @@ class Session:
                 return await self.finish(turn, t0, timings, sources)
 
             # First greeting: deliver the formal greeting once per session.
-            if not self._greeted and greet_only:
+            if not self._greeted and kind == "greeting":
                 g = s["greeting"].format(agent=s["agent_name"], business=s["business_name"])
                 await self.speak(turn, [g], t0, timings)
                 self.history += [{"role": "assistant", "content": g}]
                 self._greeted = True
                 return await self.finish(turn, t0, timings, sources)
-            # Already greeted: treat any pure greeting as small talk (LLM handles it briefly).
-            if greet_only and self._greeted:
-                greet_only = False
             if non_english:
                 await self.speak(turn, [ENGLISH_ONLY_REPLY], t0, timings)
                 return await self.finish(turn, t0, timings, sources)
@@ -532,11 +719,6 @@ class Session:
                 if handled:
                     return await self.finish(turn, t0, timings, sources)
 
-            # If the caller woke us with a greeting that also has a question, mark as greeted so we
-            # don't repeat the formal greeting on later turns.
-            if not self._greeted and greet_only is False and SMALLTALK.match(user_text.strip()):
-                self._greeted = True
-
             # retrieval
             tr0 = time.perf_counter()
             kb = ENGINES["kb"]
@@ -547,17 +729,51 @@ class Session:
                 extra = await loop.run_in_executor(None, kb.search, f"{prev_user} {user_text}", 2)
                 have = {c.id for c, _ in context}
                 context += [(c, sc) for c, sc in extra if c.id not in have][:1]
+            best = max((sc for _, sc in context), default=0.0)
+            # Follow-up handling: "and the price?", "how much is it?", "what about that one?"
+            # only make sense together with earlier turns. When the plain query retrieves
+            # nothing relevant (and there is conversation history to resolve against), an LLM
+            # rewrites the message into a standalone question using the session history and
+            # the search runs again. Self-contained questions never pay this extra latency.
+            timings["rewrite_ms"] = 0
+            if (best < s["min_retrieval_score"] and self.history
+                    and kind not in ("greeting", "goodbye", "thanks")
+                    and len(user_text.split()) <= 8):
+                rw0 = time.perf_counter()
+                standalone = await self._standalone_query(user_text)
+                if standalone and standalone.strip().lower() != user_text.strip().lower():
+                    extra2 = await loop.run_in_executor(None, kb.search, standalone)
+                    have2 = {c.id for c, _ in context}
+                    context += [(c, sc) for c, sc in extra2 if c.id not in have2][:2]
+                timings["rewrite_ms"] = round((time.perf_counter() - rw0) * 1000)
             timings["retrieval_ms"] = round((time.perf_counter() - tr0) * 1000)
             sources = [{"title": c.title, "score": round(sc, 3)} for c, sc in context]
             best = max((sc for _, sc in context), default=0.0)
-            small_talk = bool(SMALLTALK.match(user_text.strip())) and len(user_text.split()) <= 6
+            small_talk = kind in ("greeting", "goodbye", "thanks")
 
-            if best < s["min_retrieval_score"] and not small_talk:
-                unknown = True
+            # Guardrail: detect out-of-domain questions before asking the LLM.
+            # When in scope (or when the check is unavailable), the LLM itself decides:
+            # identity/meta questions ("who are you") are answered directly, and only a
+            # real UNKNOWN triggers the fallback — never a good retrieval score alone.
+            ood_reply = None
+            if not small_talk and best < s["min_retrieval_score"]:
+                ood_reply = await self._check_out_of_domain(user_text, context)
+            if ood_reply:
+                await self.speak(turn, [ood_reply], t0, timings)
+                self.history += [{"role": "user", "content": user_text},
+                                 {"role": "assistant", "content": ood_reply}]
+                # A scope redirect is a complete reply: do not also run the unknown
+                # fallback (which would double-speak and ask for contact details).
+                self._unknown_streak = 0
             else:
-                unknown = await self.llm_reply(turn, user_text, context, t0, timings)
+                unknown = await self.llm_reply(turn, user_text, context, t0, timings, sources=sources)
+                if not unknown:
+                    self._unknown_streak = 0
             if unknown:
                 await self.handle_unknown(turn, user_text, t0, timings)
+            else:
+                # A full reply happened, so a later "hello" must not re-introduce the agent.
+                self._greeted = True
             await self.finish(turn, t0, timings, sources, unknown)
         except asyncio.CancelledError:
             raise
@@ -565,7 +781,7 @@ class Session:
             await self.send({"type": "error", "turn": turn, "message": f"{type(e).__name__}: {e}"})
             self.speaking_turn = None
 
-    async def llm_reply(self, turn, user_text, context, t0, timings) -> bool:
+    async def llm_reply(self, turn, user_text, context, t0, timings, sources: list | None = None) -> bool:
         """Stream the LLM reply into TTS. Returns True if the model said it does not know."""
         s = self.settings
         # Pass greeting state and the last answer so the LLM avoids repetition.
@@ -669,8 +885,12 @@ class Session:
                 _log = __import__("logging").getLogger("session")
                 _log.debug("v2 log_unanswered_v2 skipped: %s", e)
         entry = store.log_unanswered(user_text, self.id, self.mode)
+        self._unknown_streak += 1
+        # Ask for contact details only after several unanswerable questions in a row;
+        # a single miss mid-conversation must not hijack the next question.
+        ask_contact = self.capture_contact and self._unknown_streak >= 2
         lines = [s["fallback_text"]]
-        if self.capture_contact:
+        if ask_contact:
             lines.append("May I have your name and phone number?")
             self.pending_contact = {"entry": entry["id"], "name": "", "phone": "", "attempts": 0}
         if not self.history or self.history[-1].get("content") != user_text:
@@ -681,29 +901,33 @@ class Session:
     async def contact_step(self, turn, text, t0, timings) -> bool:
         """Collect name and phone after an unanswered question. Returns False if the caller moved on to a new question."""
         pc = self.pending_contact
-        if DECLINE.match(text.strip()) and not extract_phone(text):
-            store.update_unanswered(pc["entry"], note="caller declined to leave contact details")
-            self.pending_contact = None
-            await self.speak(turn, ["No problem. I've logged your question and the team will look into it."], t0, timings)
-            return True
         name, phone = "", extract_phone(text)
+        move_on = False
         try:
             raw = await ENGINES["llm"].complete(
-                [{"role": "system", "content": contact_prompt()}, {"role": "user", "content": text}], max_tokens=60)
+                [{"role": "system", "content": contact_prompt()}, {"role": "user", "content": text}], max_tokens=40)
             m = re.search(r"\{.*\}", raw, re.S)
             data = json.loads(m.group(0)) if m else {}
             name = str(data.get("name", "")).strip()[:60]
             phone = phone or re.sub(r"\D", "", str(data.get("phone", "")))
+            # The LLM judges (with the message as a whole) whether the caller moved on.
+            move_on = bool(data.get("move_on"))
         except Exception:
-            pass
+            move_on = bool(DECLINE.match(text.strip()))   # emergency fallback, LLM unreachable
         if len(phone) < 6:
             phone = ""
         if name.lower() in ("", "none", "null", "unknown"):
             name = ""
         if not name and not phone:
+            if move_on:
+                store.update_unanswered(pc["entry"], note="caller declined to leave contact details")
+                self.pending_contact = None
+                await self.speak(turn, ["No problem. I've logged your question and the team will look into it."], t0, timings)
+                return True
             pc["attempts"] += 1
-            if pc["attempts"] >= 2 or "?" in text or len(text.split()) > 8 or QUESTION_START.match(text.strip()):
-                # caller has moved on; keep the logged question and answer the new one
+            if pc["attempts"] >= 1:
+                # nothing given on this message: stop chasing contact details and let the
+                # turn flow to the normal answer path instead of swallowing real questions
                 store.update_unanswered(pc["entry"], note="no contact details given")
                 self.pending_contact = None
                 return False
@@ -727,6 +951,80 @@ class Session:
         ask = "And your phone number, please?" if not pc["phone"] else "And may I have your name?"
         await self.speak(turn, [ask], t0, timings)
         return True
+
+    async def _check_out_of_domain(self, user_text: str, context: list) -> str | None:
+        """LLM-based scope guardrail.
+
+        Returns a short polite redirect when the utterance is clearly outside
+        {business_name}'s domain, or None when it is — or might be — about our business,
+        so the normal answer / fallback flow can handle it.
+
+        The decision is made by the LLM from the business identity in settings, the topics
+        our knowledge base covers, and the recent conversation. No hardcoded keyword lists:
+        the guardrail keeps working as the knowledge base and settings change.
+        """
+        s = self.settings
+        llm = ENGINES.get("llm")
+        if not llm:
+            return None
+
+        kb = ENGINES.get("kb")
+        topics: list[str] = []
+        if kb:
+            seen: set[str] = set()
+            for c in kb.chunks:
+                t = re.sub(r"\s*\(part \d+\)$", "", c.title).strip()
+                if ":" in t:
+                    t = t.split(":")[-1].strip()
+                if t and t.lower() not in seen:
+                    seen.add(t.lower())
+                    topics.append(t)
+
+        prompt = (
+            f"You are {s['agent_name']}, the receptionist at {s['business_name']}, a "
+            f"{s.get('business_type') or 'hospitality'} business. You only answer questions "
+            f"about this business and its services.\n"
+        )
+        if topics:
+            prompt += "\nTopics you can talk about: " + "; ".join(topics[:25]) + ".\n"
+        convo = self._recent_exchange()
+        if convo:
+            prompt += "\nRecent part of your conversation with this customer:\n" + convo + "\n"
+        prompt += (
+            "\nThe customer just said:\n\"" + user_text + "\"\n"
+            "in_scope=true when a receptionist here would treat this as a question meant for "
+            "us — anything about our rooms, prices, facilities, food, activities, events, "
+            "location, policies or bookings, or a short follow-up to what you were just "
+            "discussing, even if it does not name the business.\n"
+            "in_scope=false for general knowledge, news, other businesses or places, personal "
+            "or professional advice, or anything unrelated to us.\n"
+            "When in_scope=false, write a short warm reply of one sentence (20 words max) that "
+            "politely steers the customer back to what you can help with; do not answer the "
+            "question itself.\n"
+            'Reply with JSON only, like {"in_scope": true, "reply": ""} or '
+            '{"in_scope": false, "reply": "I can only help with questions about our resort."}. '
+            f"Name {s['business_name']} in the reply only if it fits naturally."
+        )
+        try:
+            resp = await asyncio.wait_for(
+                llm.complete([{"role": "user", "content": prompt}], max_tokens=40),
+                timeout=4.0,
+            )
+            m = re.search(r"\{.*\}", resp, re.S)
+            if not m:
+                return None
+            data = json.loads(m.group(0))
+            if data.get("in_scope"):
+                return None
+            answer = str(data.get("reply") or "").strip()
+            if not answer:
+                return None
+            return clean_for_speech(answer)
+        except Exception as e:
+            # Fail open: if the scope check is unavailable, the normal answer / UNKNOWN
+            # fallback flow still handles the turn safely.
+            _log.debug("scope guardrail fell back to normal flow: %s", e)
+            return None
 
     async def finish(self, turn, t0, timings, sources, unknown=False):
         timings["total_ms"] = round((time.perf_counter() - t0) * 1000)

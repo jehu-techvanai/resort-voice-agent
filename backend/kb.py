@@ -279,7 +279,13 @@ class KnowledgeBase:
         self.model = None
         if not config.MOCK:
             from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(config.EMBED_MODEL, device=config.DEVICE)
+            try:
+                # offline-first: the model is already in the local HF cache, so skip the
+                # network HEAD checks at every startup (cuts ~10s from boot time)
+                self.model = SentenceTransformer(config.EMBED_MODEL, device=config.DEVICE,
+                                                 local_files_only=True)
+            except Exception:
+                self.model = SentenceTransformer(config.EMBED_MODEL, device=config.DEVICE)
         self.version = None
         self.chunks: list[Chunk] = []
         self.matrix = None

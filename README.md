@@ -1,6 +1,25 @@
-# Voice Agent (v0.3)
+# Voice Agent (v2)
 
 A hands-free voice receptionist built from small open models: Whisper (speech to text), bge-small (retrieval), a 3B LLM through Ollama, and Kokoro (voice). It answers from a knowledge base you upload, and logs questions it cannot answer for a callback.
+
+## What's new in v2
+
+### Conversation intelligence — the LLM decides, not keyword lists
+- **Natural conversation memory.** The LLM was never seeing its own replies (a bug in v0.3 dropped them from session history), so conversations felt robotic. Fixed: every reply is remembered, wake checks, routing and retrieval all read the last turns.
+- **Wake decisions by the LLM.** Follow-ups like "OK, price ranges" after a price discussion are recognized without the calling name; the same call also cleans obvious speech-to-text slips ("praise ranges" → "price ranges") before retrieval. The old name/greeting matcher only runs if the LLM is unreachable, so a dead Ollama never kills the line.
+- **Greetings, goodbyes and thank-yous** are classified by the LLM from the conversation, so brief replies get a friendly one-liner instead of restarting the topic.
+- **Scope guardrail.** The long hardcoded keyword list is replaced by an LLM check built from the business name, business type and the actual knowledge-base topics. Out-of-scope questions get a short warm redirect; it keeps working automatically as you rename the business or edit the KB.
+- **Follow-up questions.** Short follow-ups ("and the price?", "what about that one?") that retrieve nothing are rewritten by the LLM into a standalone question using the session history, then searched again. Direct questions pay no extra latency.
+
+### Production hardening
+- **No silent crashes.** WebSocket handlers log full tracebacks instead of failing invisibly; the LLM keep-alive task is cancelled on shutdown.
+- **Session limits:** `WS_MAX_SESSIONS` (8), `WS_IDLE_TIMEOUT_SEC` (600, with a browser heartbeat), and a per-frame byte cap, so dead or stuck connections can no longer hold the GPU models forever.
+- **Endpoint safety:** log-file downloads validate the filename (no path traversal), knowledge uploads are capped at `MAX_UPLOAD_BYTES` (10 MB per file), and the deprecated `Query(regex=...)` API was replaced.
+- **SQLite in production shape:** WAL journal mode and a 5s busy timeout, so dashboard reads no longer block a live voice turn.
+- **Latency percentiles.** `/api/admin/metrics` and the Observability tab now show p50/p95/max latency per turn, not just averages — tail spikes are what make callers hang up.
+
+### 2050 interface
+- The UI was redesigned as a dark sci-fi HUD: glass panels on a deep-space grid, a reactor-style voice orb with a distinct glow per state (asleep / awake / hearing / thinking / speaking), streaming chat bubbles with neon retrieval chips, a fixed glass top bar with active-state navigation, and mono typography for all timings. Settings, Conversations and Log files share the new theme.
 
 ## What's new in v0.3
 
@@ -111,6 +130,8 @@ See `.env.example`. The main ones are:
 - `ADMIN_PASSWORD`
 - `PORT`
 - `MIN_UTTERANCE_SEC`, `MIN_RMS` and `NO_SPEECH_PROB`, the noise filters
+- v2 connection limits: `WS_MAX_SESSIONS`, `WS_IDLE_TIMEOUT_SEC`, `WS_MAX_MSG_BYTES`, `MAX_UPLOAD_BYTES`
+- v2 stores: `REDIS_URL`, `SQLITE_DB`, hybrid RAG (`V2_RAG`, `V2_RERANK`, `V2_QUERY_EXPANSION`) — see `UPDATE.md` for the full list
 
 ## Live session protocol (WebSocket `/ws?mode=web`)
 

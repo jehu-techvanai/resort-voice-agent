@@ -34,6 +34,11 @@ class DB:
         try:
             self.conn = await aiosqlite.connect(str(self.path))
             self.conn.row_factory = aiosqlite.Row
+            # WAL lets dashboard reads happen while a live voice turn is writing;
+            # busy_timeout avoids immediate 'database is locked' under that mix.
+            await self.conn.execute("PRAGMA journal_mode=WAL")
+            await self.conn.execute("PRAGMA busy_timeout=5000")
+            await self.conn.execute("PRAGMA synchronous=NORMAL")
             await self._migrate()
             _log.info("v2 DB opened: %s", self.path)
             return True
@@ -351,10 +356,23 @@ class DB:
         u = await self.conn.execute_fetchone("SELECT COUNT(*) AS c FROM turns WHERE unknown=1")
         c = await self.conn.execute_fetchall("SELECT conversation_id, AVG(latency_ms) AS avg FROM turns GROUP BY conversation_id")
         latencies = [r["avg"] for r in c if r["avg"] is not None]
+        # p50/p95 latency percentiles (per Deepgram-style production gates: averages hide
+        # the tail spikes that actually make callers abandon the call)
+        lat_rows = await self.conn.execute_fetchall("SELECT latency_ms FROM turns WHERE latency_ms > 0")
+        all_lat = sorted(r["latency_ms"] for r in lat_rows)
+
+        def pct(p: float) -> int:
+            if not all_lat:
+                return 0
+            return all_lat[min(len(all_lat) - 1, max(0, round(p / 100 * (len(all_lat) - 1))))]
+
         return {
             "turns": t["c"] if t else 0,
             "unknown_turns": u["c"] if u else 0,
             "avg_latency_ms": round(sum(latencies) / max(1, len(latencies)), 1) if latencies else 0,
+            "latency_p50_ms": pct(50),
+            "latency_p95_ms": pct(95),
+            "latency_max_ms": all_lat[-1] if all_lat else 0,
             "conversations_with_turns": len(latencies),
             "unanswered_v2_count": (await self.conn.execute_fetchone("SELECT COUNT(*) AS c FROM unanswered_v2"))["c"],
         }
