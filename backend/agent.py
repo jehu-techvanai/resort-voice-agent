@@ -167,15 +167,53 @@ class Guardrails:
         return False
 
     def citation_note(self, answer: str, sources: list[dict]) -> str:
-        """Return a note to append when the answer states a number/policy not covered by sources."""
+        """Return a note to append when the answer states something not covered by sources.
+
+        The note is built dynamically from what the answer claims and what the sources
+        actually support, so it stays accurate as the knowledge base and settings change.
+        """
         if not sources:
             return ""
-        # if the answer includes rupees/prices and no source mentions price-like content, flag
-        has_currency = bool(re.search(r"rupees?|rs\.?\s*\d", answer, re.I))
-        src_has_price = any(re.search(r"rupees?|rs\.?\s*\d|\d{1,3}(,\d{3})+", c.get("text", ""), re.I) for c in sources)
-        if has_currency and not src_has_price:
-            return " (I should check that figure against our current rates.)"
-        return ""
+        src_text = " ".join(c.get("text", "") for c in sources)
+        src_lower = src_text.lower()
+
+        # Detect what the answer is claiming, then check whether any source backs it.
+        claims: list[tuple[str, re.Pattern]] = []
+        # price / rate claims
+        if re.search(r"rupees?|rs\.?\s*\d|per night|price|cost|rate", answer, re.I):
+            claims.append(("rate", re.compile(r"\d[\d,]*(?:\s*(?:rupees|rs\.?))?", re.I)))
+        # policy / rule claims
+        if re.search(r"policy|rule|cancel|deposit|check-in|check-out|breakfast|tax|extra|child|adult", answer, re.I):
+            claims.append(("policy", re.compile(r"(policy|rule|cancel|deposit|check-in|check-out|breakfast|tax|extra|child|adult)", re.I)))
+        # facility / amenity claims
+        if re.search(r"pool|gym|spa|restaurant|bar|parking|wifi|airport|transfer|pickup", answer, re.I):
+            claims.append(("facility", re.compile(r"(pool|gym|spa|restaurant|bar|parking|wifi|airport|transfer|pickup)", re.I)))
+
+        unverified: list[str] = []
+        for label, pattern in claims:
+            hit = pattern.search(answer)
+            if not hit:
+                continue
+            # Is the same concept mentioned in any source?
+            concept_text = hit.group(0).lower()
+            if concept_text not in src_lower and not any(word in src_lower for word in concept_text.split()):
+                unverified.append(label)
+
+        if not unverified:
+            return ""
+
+        # Build a short dynamic note from the unverified claim types.
+        parts: list[str] = []
+        if "rate" in unverified:
+            parts.append("those rates")
+        if "policy" in unverified:
+            parts.append("that policy")
+        if "facility" in unverified:
+            parts.append("that facility detail")
+        if not parts:
+            return ""
+        subject = " and ".join(parts) if len(parts) > 1 else parts[0]
+        return f" (I should double-check {subject} against our current information.)"
 
     def out_of_domain(self, answer: str, user_text: str) -> bool:
         """Crude out-of-domain detection: model refuses or deflects in a way that suggests scope exit."""
@@ -225,9 +263,13 @@ def system_prompt_v2(settings: dict, context: list, user_text: str, greeted: boo
     extra.append(
         "Repetition guard: "
         + ("your last spoken reply was: \"" + brief + "\". " if brief else "")
-        + "Compose each reply fresh. Never reuse whole sentences or whole phrases from your "
-        "earlier replies — the customer notices a parrot immediately. Answer the newest "
-        "message in new words."
+        + "Compose each reply fresh in new words. Never reuse a whole sentence or whole phrase "
+        "from your earlier replies — the customer notices a parrot immediately. "
+        + ("The customer is now replying to what you just said; if they are thanking you, "
+           "acknowledging your last reply, or saying something that does not ask for new "
+           "information, keep your reply brief and do not re-state the information you already "
+           "gave — a short \"you're welcome\", \"sure\", or one-line follow-up is enough. "
+           "If they do ask something new, answer only the new part." if brief else "")
     )
     extra.append(
         "Identity: questions like 'who are you' or 'what is your name' are normal and "

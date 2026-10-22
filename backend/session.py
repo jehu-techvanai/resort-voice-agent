@@ -108,6 +108,44 @@ def _sim(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _trim_repetition(text: str, prev: str) -> str | None:
+    """If `text` opens with a run that closely matches `prev`, drop the repeated run.
+
+    Returns the trimmed text, or None when there is nothing significant to trim.
+    Works at word level so the mapping between normalised and original text stays exact.
+    """
+    if not prev or not text:
+        return None
+    a_words = _norm(text).split()
+    b_words = _norm(prev).split()
+    if not a_words or not b_words:
+        return None
+    # longest common prefix, in words
+    i = 0
+    while i < len(a_words) and i < len(b_words) and a_words[i] == b_words[i]:
+        i += 1
+    # require at least ~6 words of repeat before trimming
+    if i < 6:
+        return None
+    # do not trim when the new reply is fully contained in the old one (nothing new)
+    if i >= len(a_words):
+        return None
+    # drop the repeated leading words from the original text
+    a_words_orig = text.lower().split()
+    if i >= len(a_words_orig):
+        return None
+    rest = " ".join(a_words_orig[i:]).strip()
+    if not rest:
+        return None
+    # prefer to start at a sentence boundary within the remainder
+    m = re.search(r"(?<=[.!?])\s+", rest)
+    if m:
+        rest = rest[m.end():].lstrip()
+    if len(rest) < 20:
+        return None
+    return rest
+
+
 def match_wake(text: str, name: str) -> tuple[bool, str]:
     """Return (matched, text with the calling name removed). Accepts the name at the start
     ("Maya, ...", "Hey Maya ...") or at the very end ("... , Maya?"). Fuzzy, because Whisper may write Mya / Maia."""
@@ -218,7 +256,10 @@ def system_prompt(settings: dict, context: list, greeted: bool = False,
         repeat_rule = (
             "Use the conversation history above instead of repeating yourself. If the customer's "
             "message refers back to what you already said (your last reply began: " + brief + "), "
-            "confirm briefly or add one new detail, and never copy the whole answer word for word."
+            "confirm briefly or add one new detail, and never copy the whole answer word for word. "
+            "If the customer is thanking you or acknowledging your last reply, keep your reply brief "
+            "and do not re-state the information you already gave — a short acknowledgment or one-line "
+            "follow-up is enough. If they ask something new, answer only the new part."
         )
     return f"""You are {settings['agent_name']}, the receptionist at {settings['business_name']}, a {settings.get('business_type') or 'business'}. You are speaking to a customer on the phone and your words will be read aloud.
 
@@ -860,13 +901,37 @@ class Session:
                 producer.cancel()
             if spoken:
                 full = " ".join(spoken)
-                # v2 guardrail: append citation note if we cited numbers not in sources
+                # v2 guardrail: if the new reply heavily repeats the previous one, trim the
+                # stored text so the next turn's repeat-avoidance sees a clean prior reply.
+                # The audio for this turn was already streamed, so we only adjust what is
+                # recorded in history and _last_answer — not what the client already heard.
+                if self._last_answer and len(spoken) >= 1:
+                    prev_norm = _norm(self._last_answer)
+                    cur_norm = _norm(full)
+                    if prev_norm and cur_norm and prev_norm != cur_norm:
+                        cut = _trim_repetition(full, self._last_answer)
+                        if cut:
+                            full = cut
+                # v2 guardrail: append a dynamic citation note if the answer claims
+                # something the sources do not back. Send it as its own sentence so the
+                # client renders it once, and keep turn_sentences in sync.
                 if config.V2_RAG and sources:
                     guard = Guardrails(s, retrieval_best=None)
                     note = guard.citation_note(full, sources)
                     if note:
-                        full = full.rstrip() + note
-                        self.turn_sentences[turn].append(note.strip())
+                        note_text = note.strip()
+                        # Only add the note if it is not already (roughly) present in what
+                        # the model streamed — avoids duplicating a caveat the model itself
+                        # already said.
+                        already = any(_sim(note_text, s) > 0.55 for s in spoken)
+                        if not already:
+                            full = full.rstrip() + note
+                            self.turn_sentences[turn].append(note_text)
+                            idx += 1
+                            await self.send({"type": "sentence", "turn": turn, "index": idx, "text": note_text})
+                            wav = await loop.run_in_executor(None, ENGINES["tts"].synthesize, note_text, s["voice"], s["speed"])
+                            await self.send({"type": "audio", "turn": turn, "index": idx,
+                                             "wav_b64": base64.b64encode(wav).decode()})
                 self.history.append({"role": "assistant", "content": full})
                 self.recent_agent_text += spoken
                 self._last_answer = full   # remember for next turn's repeat-avoidance
