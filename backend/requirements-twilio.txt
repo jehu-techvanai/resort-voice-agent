@@ -1,0 +1,17 @@
+# Twilio + LiveKit voice integration dependencies
+# Install with: pip install -r requirements-twilio.txt
+
+# Twilio
+twilio>=8.10.0
+
+# LiveKit Agents SDK
+livekit-agents>=1.2.0
+livekit-api>=1.2.0
+livekit-rtc>=1.2.0
+
+# Gemini Live (for LiveKit native audio)
+google-generativeai>=0.8.0
+
+# Optional: for production deployment
+gunicorn>=21.2.0
+uvicorn[standard]>=0.27.0

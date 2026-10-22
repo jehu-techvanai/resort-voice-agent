@@ -101,3 +101,18 @@ V2_QUERY_EXPANSION = _env("V2_QUERY_EXPANSION", "1") == "1"
 V2_SYNONYMS = Path(_env("V2_SYNONYMS", str(BASE_DIR / "knowledge" / "synonyms.json")))
 # session state TTL in seconds (Redis + in-process fallback)
 V2_SESSION_TTL_SEC = int(_env("V2_SESSION_TTL_SEC", "1800"))
+
+# ---- Twilio + LiveKit voice integration
+# Twilio: for inbound voice calls via Twilio telephone numbers
+TWILIO_ACCOUNT_SID = _env("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = _env("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = _env("TWILIO_PHONE_NUMBER", "")
+
+# LiveKit: for VoIP voice calls with native audio
+LIVEKIT_URL = _env("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = _env("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = _env("LIVEKIT_API_SECRET", "")
+
+# LiveKit SIP trunk for PSTN calls (optional, for direct phone integration)
+LIVEKIT_SIP_URI = _env("LIVEKIT_SIP_URI", "")
+SIP_OUTBOUND_TRUNK_ID = _env("SIP_OUTBOUND_TRUNK_ID", "")

@@ -34,6 +34,9 @@ from redis_session import RedisSessionStore
 from db import DB
 from logging_utils import setup_logging
 
+# Import Twilio router
+from twilio_router import router as twilio_router
+
 if config.STRUCTURED_LOGS:
     setup_logging()
 
@@ -75,6 +78,49 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Voice Agent", lifespan=lifespan)
+
+# Include Twilio webhook routes
+app.include_router(twilio_router, prefix="")
+
+
+# ---------------------------------------------------------------- Twilio Media Streams WebSocket
+# Twilio Media Streams connects here for real-time bidirectional audio.
+# The twilio_router generates a stream_url pointing to this endpoint.
+
+_media_stream_handler: object | None = None
+
+
+def get_media_stream_handler() -> "TwilioMediaStreamHandler":
+    global _media_stream_handler
+    if _media_stream_handler is None:
+        from livekit_worker import TwilioMediaStreamHandler
+        _media_stream_handler = TwilioMediaStreamHandler()
+    return _media_stream_handler
+
+
+@app.websocket("/ws/twilio")
+async def twilio_media_stream(ws: WebSocket, call_sid: str = Query(...)):
+    """
+    Twilio Media Streams WebSocket endpoint.
+
+    Twilio connects here after the /twilio/inbound webhook returns TwiML with a <Connect><Stream>.
+    This handles real-time bidirectional audio: receives caller audio, processes through
+    STT -> LLM -> TTS, and sends back agent audio.
+
+    Query params:
+        call_sid: The Twilio CallSid identifying this call
+    """
+    await ws.accept()
+    _log.info("Twilio Media Stream connected: call_sid=%s", call_sid)
+
+    handler = get_media_stream_handler()
+
+    try:
+        await handler.handle_websocket(ws, call_sid)
+    except WebSocketDisconnect:
+        _log.info("Twilio Media Stream disconnected: call_sid=%s", call_sid)
+    except Exception:
+        _log.exception("Twilio Media Stream error: call_sid=%s", call_sid)
 
 
 async def _keep_llm_loaded():

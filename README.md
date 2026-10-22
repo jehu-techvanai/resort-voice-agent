@@ -152,6 +152,51 @@ See `.env.example`. The main ones are:
 
 The API for other programs (phase 3) will use the same protocol with `mode=api` and an API key, and no calling name.
 
+## Phone integration (Twilio + LiveKit)
+
+### Twilio inbound calls
+
+1. Buy a phone number at [Twilio Console](https://console.twilio.com)
+2. Set the voice webhook URL to: `https://your-domain.com/twilio/inbound`
+3. Add credentials to `.env`:
+   ```
+   TWILIO_ACCOUNT_SID=ACxxxxx
+   TWILIO_AUTH_TOKEN=xxxxx
+   TWILIO_PHONE_NUMBER=+1234567890
+   ```
+4. Restart the backend: `./run.sh`
+
+The agent will answer calls and converse using the same STT→LLM→TTS pipeline.
+
+### LiveKit voice calls
+
+1. Create a project at [LiveKit Cloud](https://cloud.livekit.io)
+2. Get API credentials (API Key + Secret)
+3. Add to `.env`:
+   ```
+   LIVEKIT_URL=wss://your-project.livekit.cloud
+   LIVEKIT_API_KEY=xxxxx
+   LIVEKIT_API_SECRET=xxxxx
+   ```
+4. Run the LiveKit worker:
+   ```
+   python backend/livekit_worker.py
+   ```
+
+For PSTN calls via LiveKit SIP, also configure:
+   ```
+   LIVEKIT_SIP_URI=sip:your-trunk.sip.livekit.cloud
+   SIP_OUTBOUND_TRUNK_ID=ST_xxxxx
+   ```
+
+### Local testing with ngrok
+
+For local development, expose your backend with ngrok:
+```bash
+ngrok http 8000
+```
+Use the ngrok URL in your Twilio webhook configuration.
+
 ## Known limits
 
 - Other people talking nearby are still speech. Outside the follow-up window, the calling name is what filters them out. Inside it, nearby speech can be taken as a question.
@@ -159,3 +204,4 @@ The API for other programs (phase 3) will use the same protocol with `mode=api` 
 - Listening stops when a phone's screen locks.
 - Speech to text runs after each utterance ends, not while you speak.
 - One process with one copy of each model, so simultaneous sessions take turns.
+- Twilio Media Streams require HTTPS (use ngrok for local testing).
