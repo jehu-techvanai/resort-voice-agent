@@ -39,7 +39,7 @@ TOP_K = int(_env("TOP_K", "3"))
 
 # LLM: any OpenAI-compatible server. Defaults to Ollama on the same box.
 LLM_BASE_URL = _env("LLM_BASE_URL", "http://localhost:11434/v1")
-LLM_MODEL = _env("LLM_MODEL", "llama3.2:3b")
+LLM_MODEL = _env("LLM_MODEL", "llama3.2:1b")
 LLM_API_KEY = _env("LLM_API_KEY", "ollama")
 LLM_MAX_TOKENS = int(_env("LLM_MAX_TOKENS", "180"))
 LLM_TEMPERATURE = float(_env("LLM_TEMPERATURE", "0.3"))
