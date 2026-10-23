@@ -99,7 +99,10 @@ def get_media_stream_handler() -> "TwilioMediaStreamHandler":
 
 
 @app.websocket("/ws/twilio")
-async def twilio_media_stream(ws: WebSocket, call_sid: str = Query(...)):
+async def twilio_media_stream(ws: WebSocket, call_sid: str = Query("")):
+    # call_sid is optional: Twilio connects to this route with no query string
+    # (query parameters are not supported in <Stream url>). The real CallSid
+    # arrives in Twilio's "start" message and the handler picks it up there.
     """
     Twilio Media Streams WebSocket endpoint.
 

@@ -62,11 +62,11 @@ def generate_twiml(
 
     if use_media_stream:
         # Media Streams mode: real-time bidirectional audio
+        # NOTE: <Stream url> must NOT contain query string parameters (they are
+        # unsupported and make Twilio refuse to connect). The CallSid arrives
+        # in the WebSocket "start" event (stream.callSid) instead.
         connect = Connect()
-        stream = Stream(url=stream_url)
-        stream.token = stream_token
-        stream.track = "inbound_audio"
-        connect.append(stream)
+        connect.append(Stream(url=stream_url))
         response.append(connect)
 
         # Fallback: if stream disconnects, gather speech as backup
@@ -182,9 +182,11 @@ async def handle_inbound_call(
         }
 
     # Generate WebSocket URL for media streaming
-    # In production, this would be your public URL
+    # NOTE: no query string allowed in <Stream url> (Twilio rejects it and the
+    # caller hears the "cannot reach your server" error). The call_sid is
+    # delivered to the WebSocket handler in the Twilio "start" event instead.
     base_url = os.getenv("BASE_URL", "http://localhost:8000")
-    stream_url = f"wss://{base_url.replace('http://', '').replace('https://', '')}/ws/twilio?call_sid={call_sid}"
+    stream_url = f"wss://{base_url.replace('http://', '').replace('https://', '')}/ws/twilio"
     stream_token = str(uuid.uuid4())
 
     use_media_stream = os.getenv("TWILIO_MEDIA_STREAMS", "true").lower() == "true"
